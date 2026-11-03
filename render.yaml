@@ -1,0 +1,11 @@
+# Render 一键部署蓝图：仓库主人点击 README 里的 Deploy 按钮即可生成在线站点
+services:
+  - type: web
+    name: netease-music-age
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production

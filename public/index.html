@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>音乐年龄测试 · 你的耳朵多少岁？</title>
+<meta name="description" content="输入网易云音乐主页链接，根据「喜欢的音乐」歌单全量歌曲的发行年份，算出你的音乐年龄。">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main class="wrap">
+  <header class="hero">
+    <h1>音乐年龄测试</h1>
+    <p class="tagline">输入网易云音乐主页链接，看看你的耳朵多少岁</p>
+    <p class="how">算法很简单：假设每首歌都是在发行那年、你 17 岁时听到的，<br>单曲音乐年龄 = 今年 − 发行年份 + 17，全部取平均。</p>
+  </header>
+
+  <section class="card" id="formCard">
+    <form id="ageForm">
+      <label for="linkInput">网易云音乐主页链接</label>
+      <div class="row">
+        <input id="linkInput" type="text" inputmode="url" autocomplete="off" spellcheck="false"
+               placeholder="粘贴主页链接，如 https://music.163.com/user/home?id=… 或 App 分享的短链接">
+        <button id="submitBtn" type="submit">开始测试</button>
+      </div>
+      <p class="hint">怎么拿到链接：在网易云 App 里进入任意用户主页 → 分享 → 复制链接；也可以粘贴电脑端主页链接，或直接填用户 ID。<br>注意：对方的「我喜欢的音乐」歌单需要设为公开。</p>
+    </form>
+    <div id="progress" class="progress hidden">
+      <div class="stage" id="stageText">正在解析链接…</div>
+      <div class="barOuter"><div class="barInner" id="barInner"></div></div>
+      <div class="barText" id="barText"></div>
+    </div>
+    <div id="errorBox" class="error hidden"></div>
+  </section>
+
+  <section class="card result hidden" id="resultCard">
+    <div class="userLine">
+      <img id="avatar" alt="" class="avatar hidden">
+      <div>
+        <div class="nickname" id="rNickname"></div>
+        <div class="meta" id="rMeta"></div>
+      </div>
+    </div>
+    <div class="ageNum"><span id="rAge"></span><span class="ageUnit">岁</span></div>
+    <div class="ageLabel" id="rLabel"></div>
+
+    <div class="grid">
+      <div class="box"><div class="boxTitle">最老的歌</div><div class="boxMain" id="rOldest"></div><div class="boxSub" id="rOldestSub"></div></div>
+      <div class="box"><div class="boxTitle">最新的歌</div><div class="boxMain" id="rNewest"></div><div class="boxSub" id="rNewestSub"></div></div>
+    </div>
+
+    <h3>年代分布</h3>
+    <div id="rDecades"></div>
+
+    <h3>歌单里最多的歌手</h3>
+    <div class="artists" id="rArtists"></div>
+
+    <p class="foot" id="rFoot"></p>
+    <button id="againBtn" class="secondary" type="button">再测一个</button>
+  </section>
+
+  <footer class="siteFoot">
+    <p>数据来自网易云公开接口，数据层基于开源项目
+      <a href="https://github.com/Binaryify/NeteaseCloudMusicApi" target="_blank" rel="noopener">NeteaseCloudMusicApi</a>；
+      玩法原型为日本站「音楽数珠つなぎ」30 MUSIC CHALLENGE（该站公布的用户平均音乐年龄为 28 岁）。</p>
+    <p><a href="https://github.com/AYoungSablinoid/netease-music-age" target="_blank" rel="noopener">GitHub 源码</a> · 本站只读取公开数据，不保存任何用户信息。</p>
+  </footer>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

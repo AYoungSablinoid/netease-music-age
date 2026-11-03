@@ -22,7 +22,32 @@
 - 没有发行年份的歌曲（如部分新歌单曲）不参与计算，数量会在结果中单独注明；
 - 不做加权——每首歌权重相同，算的是“歌单品味的平均年代”，不是“实际收听频次”。
 
-## 快速开始
+## 在线体验（网站版）
+
+本项目自带一个完整的网站：打开页面 → 粘贴网易云主页链接 → 自动拉取「喜欢的音乐」歌单并算出音乐年龄，带进度条和结果卡，手机上也能用。
+
+**一键部署到 Render（免费）：**
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/AYoungSablinoid/netease-music-age)
+
+用 GitHub 账号登录后点部署，约 1 分钟即可得到一个 `https://netease-music-age.onrender.com` 形式的在线地址，任何人打开就能测。（免费实例闲置后会休眠，下次打开需等几十秒唤醒。）
+
+也可以部署到任何支持 Node.js 的托管（Railway、自己的服务器等）：
+
+```bash
+npm install
+npm start          # 监听 PORT 环境变量指定的端口，默认 3000
+```
+
+本地预览同理，执行 `npm start` 后打开 http://localhost:3000 。
+
+网站结构：
+
+- `server.js` — 零额外依赖的 Node 后端，只负责取数：解析主页/短链接、返回用户与喜欢歌单的全量 trackIds、批量查询歌曲发行年份（带缓存与失败重试）；
+- `public/` — 前端页面（输入框、进度条、结果卡），音乐年龄的计算在浏览器端完成；
+- `music-age.js` — 命令行版（见下节），与网站共用同一套算法。
+
+## 快速开始（命令行版）
 
 需要 Node.js 18+。
 

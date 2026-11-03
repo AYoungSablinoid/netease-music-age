@@ -1,0 +1,116 @@
+:root {
+  --bg: #f6f6f8;
+  --card: #ffffff;
+  --text: #22242a;
+  --muted: #8a8f98;
+  --border: #e7e7ec;
+  --accent: #e60026;
+  --accent-dark: #c20020;
+  --soft: #fafafa;
+  --error-bg: #fff1f1;
+  --error-text: #b00020;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #141519;
+    --card: #1e2026;
+    --text: #eceef2;
+    --muted: #9aa0ab;
+    --border: #2c2f37;
+    --soft: #26282f;
+    --error-bg: #3a1d22;
+    --error-text: #ff9aa8;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  line-height: 1.6;
+}
+.wrap { max-width: 640px; margin: 0 auto; padding: 32px 16px 48px; }
+.hero { text-align: center; margin-bottom: 24px; }
+.hero h1 { font-size: 34px; margin: 0 0 6px; letter-spacing: 1px; }
+.tagline { font-size: 17px; margin: 0 0 10px; }
+.how { color: var(--muted); font-size: 13.5px; margin: 0; }
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 22px;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.06);
+  margin-bottom: 20px;
+}
+label { display: block; font-weight: 600; margin-bottom: 8px; }
+.row { display: flex; gap: 10px; }
+input[type="text"] {
+  flex: 1; min-width: 0;
+  padding: 12px 14px;
+  font-size: 15px;
+  color: var(--text);
+  background: var(--soft);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  outline: none;
+}
+input[type="text"]:focus { border-color: var(--accent); }
+button {
+  padding: 12px 20px;
+  font-size: 15px; font-weight: 600;
+  color: #fff; background: var(--accent);
+  border: none; border-radius: 10px; cursor: pointer;
+  white-space: nowrap;
+}
+button:hover { background: var(--accent-dark); }
+button:disabled { opacity: 0.55; cursor: wait; }
+button.secondary {
+  background: transparent; color: var(--accent);
+  border: 1px solid var(--accent); width: 100%; margin-top: 16px;
+}
+button.secondary:hover { background: var(--accent); color: #fff; }
+.hint { color: var(--muted); font-size: 12.5px; margin: 10px 0 0; }
+.hidden { display: none !important; }
+.progress { margin-top: 18px; }
+.stage { font-size: 14px; margin-bottom: 8px; }
+.barOuter { height: 10px; background: var(--border); border-radius: 5px; overflow: hidden; }
+.barInner {
+  height: 100%; width: 0%;
+  background: var(--accent); border-radius: 5px;
+  transition: width 0.3s ease;
+}
+.barText { color: var(--muted); font-size: 12.5px; margin-top: 6px; }
+.error {
+  margin-top: 16px; padding: 12px 14px;
+  background: var(--error-bg); color: var(--error-text);
+  border-radius: 10px; font-size: 14px;
+}
+.userLine { display: flex; align-items: center; gap: 12px; }
+.avatar { width: 48px; height: 48px; border-radius: 50%; object-fit: cover; }
+.nickname { font-size: 19px; font-weight: 700; }
+.meta { color: var(--muted); font-size: 13px; }
+.ageNum { text-align: center; font-size: 72px; font-weight: 800; color: var(--accent); line-height: 1.15; margin-top: 10px; }
+.ageUnit { font-size: 26px; margin-left: 4px; }
+.ageLabel { text-align: center; font-size: 17px; margin-bottom: 8px; }
+.grid { display: flex; gap: 12px; margin: 16px 0 4px; }
+.box { flex: 1; background: var(--soft); border-radius: 10px; padding: 10px 12px; min-width: 0; }
+.boxTitle { color: var(--muted); font-size: 12.5px; margin-bottom: 4px; }
+.boxMain { font-weight: 700; font-size: 15px; word-break: break-all; }
+.boxSub { color: var(--muted); font-size: 12.5px; word-break: break-all; }
+.result h3 { margin: 18px 0 8px; font-size: 15px; }
+.decadeRow { display: flex; align-items: center; gap: 8px; font-size: 13px; margin: 4px 0; }
+.decadeRow .dName { width: 58px; flex-shrink: 0; }
+.decadeRow .dBarWrap { flex: 1; height: 10px; background: var(--border); border-radius: 5px; overflow: hidden; }
+.decadeRow .dBar { height: 100%; background: var(--accent); border-radius: 5px; min-width: 2px; }
+.decadeRow .dCount { width: 74px; flex-shrink: 0; color: var(--muted); }
+.artists { font-size: 14.5px; }
+.foot { color: var(--muted); font-size: 12.5px; margin-top: 16px; }
+.siteFoot { color: var(--muted); font-size: 12.5px; text-align: center; }
+.siteFoot a { color: var(--accent); text-decoration: none; }
+.siteFoot a:hover { text-decoration: underline; }
+@media (max-width: 520px) {
+  .row { flex-direction: column; }
+  button { width: 100%; }
+  .ageNum { font-size: 56px; }
+}
