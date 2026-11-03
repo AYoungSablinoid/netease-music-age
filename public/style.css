@@ -146,6 +146,43 @@ button.mini:hover { border-color: var(--accent); color: var(--accent); backgroun
 }
 .dlBtn:hover { background: var(--accent); color: #fff; }
 #challengeBox { margin-top: 12px; }
+.chTabs { display: flex; gap: 8px; margin-bottom: 12px; }
+.chTab {
+  flex: 1; padding: 9px 6px; font-size: 14px; border-radius: 10px;
+  border: 1px solid var(--border); background: var(--card); color: var(--muted); cursor: pointer;
+}
+.chTab:hover { background: var(--card); color: var(--accent); border-color: var(--accent); }
+.wizSlot:hover { background: var(--card); color: var(--accent); border-color: var(--accent); }
+.chTab.active { border-color: var(--accent); color: var(--accent); background: var(--soft); font-weight: 600; }
+.wizSlots { display: grid; grid-template-columns: repeat(10, 1fr); gap: 5px; margin: 10px 0 4px; }
+.wizSlot {
+  padding: 5px 0; text-align: center; font-size: 12px; border-radius: 7px;
+  border: 1px solid var(--border); background: var(--card); color: var(--muted); cursor: pointer;
+}
+.wizSlot.filled { background: var(--soft); color: var(--accent); border-color: var(--accent); }
+.wizSlot.current { outline: 2px solid var(--accent); outline-offset: 1px; font-weight: 700; color: var(--text); }
+.wizCard {
+  border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; margin: 10px 0;
+  background: linear-gradient(180deg, var(--soft), var(--card));
+}
+.wizHead { display: flex; justify-content: space-between; align-items: center; font-size: 13px; color: var(--muted); }
+.wizPrompt { font-size: 19px; font-weight: 700; margin: 8px 0 6px; }
+.wizCurrent { font-size: 13.5px; color: var(--muted); }
+.wizCurrent b { color: var(--accent); }
+#wizSearch { width: 100%; }
+#wizList { max-height: 320px; overflow-y: auto; margin: 8px 0 12px; }
+.wizPick { cursor: pointer; width: 100%; text-align: left; }
+.wizPick:hover { border-color: var(--accent); }
+#wizCalcBtn { width: 100%; }
+#wizAnswers { margin: 10px 0; }
+.wizAnswerRow {
+  display: flex; gap: 8px; align-items: baseline; font-size: 13.5px;
+  padding: 7px 10px; border: 1px solid var(--border); border-radius: 9px;
+}
+.wizAnswerRow + .wizAnswerRow { margin-top: 6px; }
+.wizAnswerRow .q { color: var(--muted); flex-shrink: 0; }
+.wizAnswerRow .x { margin-left: auto; flex-shrink: 0; }
+#chBreakdown { margin-top: 10px; }
 #chSearch { width: 100%; margin-top: 4px; }
 #chList { max-height: 380px; overflow-y: auto; margin: 8px 0 12px; }
 #chCalcBtn { width: 100%; }

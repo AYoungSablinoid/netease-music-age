@@ -297,6 +297,8 @@ function renderResult(user, selPlaylists, songs, noYear, rawTotal, uniqueTotal, 
   $('challengeBox').classList.add('hidden');
   $('chResult').classList.add('hidden');
   chSelected.clear();
+  wizAnswers = new Array(30).fill(null);
+  wizCur = 0;
   const sorted = [...songs].sort((a, b) => a.year - b.year);
   const oldest = sorted[0];
   const newest = sorted[sorted.length - 1];
@@ -434,6 +436,8 @@ $('againBtn').addEventListener('click', () => {
   lastRecordSongs = [];
   lastTopSongs = [];
   chSelected.clear();
+  wizAnswers = new Array(30).fill(null);
+  wizCur = 0;
   input.value = '';
   input.focus();
   window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -608,6 +612,7 @@ $('challengeOpenBtn').addEventListener('click', () => {
   $('chResult').classList.add('hidden');
   renderChList();
   updateChCount();
+  renderWizard();
   $('challengeBox').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 });
 $('chSearch').addEventListener('input', renderChList);
@@ -615,9 +620,7 @@ $('chOldest').addEventListener('click', () => chQuickPick([...chPool].sort((a, b
 $('chNewest').addEventListener('click', () => chQuickPick([...chPool].sort((a, b) => b.year - a.year).slice(0, 30)));
 $('chTop').addEventListener('click', () => chQuickPick(lastTopSongs.slice(0, 30), '这个用户的听歌排行未公开或还没加载完，暂时没有「历史最爱」参考歌单。'));
 $('chClear').addEventListener('click', () => { chSelected.clear(); renderChList(); updateChCount(); });
-$('chCalcBtn').addEventListener('click', () => {
-  const picked = [...chSelected].map((i) => chPool[i]).filter(Boolean);
-  if (picked.length !== 30) return;
+function showChallengeResult(picked, breakdownItems) {
   const avg = picked.reduce((a, s) => a + (CURRENT_YEAR - s.year + 17), 0) / picked.length;
   const musicAge = Math.round(avg);
   const median = medianAgeOf(picked);
@@ -634,6 +637,212 @@ $('chCalcBtn').addEventListener('click', () => {
     else if (d <= -1) cmp = `比歌单全量结果（${lastResult.musicAge} 岁）年轻 ${-d} 岁：你心中的代表作，比日常歌单更年轻。`;
   }
   $('chCompare').textContent = cmp;
+  const bd = $('chBreakdown');
+  bd.innerHTML = '';
+  if (breakdownItems && breakdownItems.length) {
+    const h = document.createElement('h3');
+    h.textContent = '我的 30 个命题答案';
+    bd.appendChild(h);
+    for (const it of breakdownItems) {
+      const row = document.createElement('div');
+      row.className = 'wizAnswerRow';
+      const q = document.createElement('span');
+      q.className = 'q';
+      q.textContent = `${it.no}. ${it.prompt}`;
+      const s = document.createElement('span');
+      s.textContent = `${it.song.name} — ${it.song.artist}`;
+      const x = document.createElement('span');
+      x.className = 'x';
+      x.textContent = `${it.song.year} 年 · 单曲 ${CURRENT_YEAR - it.song.year + 17} 岁`;
+      row.append(q, s, x);
+      bd.appendChild(row);
+    }
+  }
   $('chResult').classList.remove('hidden');
   $('chResult').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+$('chCalcBtn').addEventListener('click', () => {
+  const picked = [...chSelected].map((i) => chPool[i]).filter(Boolean);
+  if (picked.length !== 30) return;
+  showChallengeResult(picked, null);
 });
+
+// ---------- 命题向导（参考原站 30 MUSIC CHALLENGE：一题一首、逐题作答） ----------
+// 30 个命题分三类：日常与心情 / 标题与特征 / 回忆与喜好。命题文案为本站自拟，玩法结构参考原站：
+// 一次只面对一题，在候选里搜索点选作答，随时看进度和已答清单，答满 30 题出分并逐题回顾。
+const PROMPTS = [
+  ['日常与心情', '今天听的第一首歌'],
+  ['日常与心情', '雨天想听的歌'],
+  ['日常与心情', '睡前想听的歌'],
+  ['日常与心情', '能把自己从低谷里拉起来的歌'],
+  ['日常与心情', '心情不好时反复听的歌'],
+  ['日常与心情', '听了就忍不住跟唱的歌'],
+  ['日常与心情', '通勤路上想听的歌'],
+  ['日常与心情', '想在自己的葬礼上放的歌'],
+  ['日常与心情', '属于你的夏日之歌'],
+  ['日常与心情', '深夜一个人时想听的歌'],
+  ['标题与特征', '歌名里带「星」的歌'],
+  ['标题与特征', '歌名里带花名的歌'],
+  ['标题与特征', '歌名里带地名的歌'],
+  ['标题与特征', '和食物有关的歌'],
+  ['标题与特征', '不到三分钟的歌'],
+  ['标题与特征', '歌名只有一个字的歌'],
+  ['标题与特征', '吉他 solo 让你起鸡皮疙瘩的歌'],
+  ['标题与特征', '节奏或速度中途变化的歌'],
+  ['标题与特征', '以英文歌词为主的歌'],
+  ['标题与特征', '五人及以上团体 / 乐队的歌'],
+  ['回忆与喜好', '你觉得被严重低估的歌'],
+  ['回忆与喜好', '想安利别人先看歌词的歌'],
+  ['回忆与喜好', '你的音乐启蒙之歌'],
+  ['回忆与喜好', '听过现场后才爱上的歌'],
+  ['回忆与喜好', '想戴耳机逐字细听的歌'],
+  ['回忆与喜好', '想送给最重要的人的歌'],
+  ['回忆与喜好', '两位你喜欢的歌手合作的歌'],
+  ['回忆与喜好', '主打之外最爱的 B 面曲'],
+  ['回忆与喜好', '流媒体上找不到的宝藏歌'],
+  ['回忆与喜好', '你自己的主题曲'],
+];
+let wizAnswers = new Array(30).fill(null); // 每题选中的候选下标（chPool 下标），null 为未答
+let wizCur = 0;
+function wizUsedBy(idx) {
+  for (let i = 0; i < 30; i++) if (wizAnswers[i] === idx) return i;
+  return -1;
+}
+function wizAnsweredCount() { return wizAnswers.filter((x) => x != null).length; }
+function renderWizard() {
+  // 进度格
+  const slots = $('wizSlots');
+  slots.innerHTML = '';
+  PROMPTS.forEach((p, i) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'wizSlot' + (wizAnswers[i] != null ? ' filled' : '') + (i === wizCur ? ' current' : '');
+    b.textContent = wizAnswers[i] != null ? '✓' : String(i + 1);
+    b.title = `第 ${i + 1} 题：${p[1]}`;
+    b.addEventListener('click', () => { wizCur = i; $('wizSearch').value = ''; renderWizard(); });
+    slots.appendChild(b);
+  });
+  // 进度文字（含已答歌曲的实时平均预览，和原站一样每首歌下面能看到它的单曲音乐年龄）
+  const answered = wizAnswers.filter((x) => x != null).map((i) => chPool[i]).filter(Boolean);
+  const n = answered.length;
+  let preview = '';
+  if (n) {
+    const avg = answered.reduce((a, s) => a + (CURRENT_YEAR - s.year + 17), 0) / n;
+    preview = ` · 已答歌曲当前平均音乐年龄约 ${Math.round(avg)} 岁（预览，答满后为准）`;
+  }
+  $('wizProgress').textContent = `已答 ${n} / 30 题${preview}`;
+  // 当前命题卡
+  const [cat, prompt] = PROMPTS[wizCur];
+  $('wizStep').textContent = `第 ${wizCur + 1} / 30 题`;
+  $('wizCat').textContent = cat;
+  $('wizPrompt').textContent = prompt;
+  const curIdx = wizAnswers[wizCur];
+  const curSong = curIdx != null ? chPool[curIdx] : null;
+  $('wizCurrent').innerHTML = curSong
+    ? `本题已选：<b></b>（${curSong.year} 年，单曲音乐年龄 ${CURRENT_YEAR - curSong.year + 17} 岁）——在下面点另一首即可更换`
+    : '本题还没选：在下面搜索点选一首，或用快捷按钮先填一首';
+  if (curSong) $('wizCurrent').querySelector('b').textContent = `${curSong.name} — ${curSong.artist}`;
+  // 候选列表：排除已被其他题选走的歌，本题已选的置顶标出
+  const q = $('wizSearch').value.trim().toLowerCase();
+  const list = $('wizList');
+  list.innerHTML = '';
+  let shown = 0;
+  chPool.forEach((s, idx) => {
+    if (shown >= 30) return;
+    if (q && !`${s.name} ${s.artist}`.toLowerCase().includes(q)) return;
+    const usedBy = wizUsedBy(idx);
+    if (usedBy >= 0 && usedBy !== wizCur) return;
+    shown++;
+    const row = document.createElement('div');
+    row.className = 'playlistRow wizPick';
+    row.innerHTML =
+      `<span class="plMain"><span class="plName"></span><span class="plSub"></span></span>` +
+      `<span class="tag">${usedBy === wizCur ? '本题已选 · ' : ''}${s.year} 年 · 单曲 ${CURRENT_YEAR - s.year + 17} 岁</span>`;
+    row.querySelector('.plName').textContent = s.name;
+    row.querySelector('.plSub').textContent = s.artist;
+    row.addEventListener('click', () => wizAnswer(idx));
+    list.appendChild(row);
+  });
+  if (!shown) {
+    const p = document.createElement('p');
+    p.className = 'recordNote';
+    p.textContent = q ? '候选里没有匹配的歌，换个关键词试试。' : '候选不足或都已被其他题选走。';
+    list.appendChild(p);
+  }
+  // 已答清单
+  const box = $('wizAnswers');
+  box.innerHTML = '';
+  PROMPTS.forEach((p, i) => {
+    const ai = wizAnswers[i];
+    if (ai == null) return;
+    const s = chPool[ai];
+    if (!s) return;
+    const row = document.createElement('div');
+    row.className = 'wizAnswerRow';
+    const qEl = document.createElement('span');
+    qEl.className = 'q';
+    qEl.textContent = `${i + 1}. ${p[1]}`;
+    const sEl = document.createElement('span');
+    sEl.textContent = `${s.name} — ${s.artist}（${s.year} 年）`;
+    const x = document.createElement('button');
+    x.type = 'button';
+    x.className = 'mini x';
+    x.textContent = '改';
+    x.addEventListener('click', () => { wizCur = i; $('wizSearch').value = ''; renderWizard(); $('wizSlots').scrollIntoView({ behavior: 'smooth', block: 'center' }); });
+    row.append(qEl, sEl, x);
+    box.appendChild(row);
+  });
+  $('wizCalcBtn').disabled = wizAnsweredCount() !== 30;
+  $('wizPrevBtn').disabled = wizCur === 0;
+  $('wizNextBtn').disabled = wizCur === 29;
+}
+function wizAnswer(idx) {
+  wizAnswers[wizCur] = idx;
+  $('wizSearch').value = '';
+  // 自动前进到下一道未答题（都答完则停留在最后一题）
+  let next = -1;
+  for (let k = 1; k <= 30; k++) {
+    const j = (wizCur + k) % 30;
+    if (wizAnswers[j] == null) { next = j; break; }
+  }
+  if (next >= 0) wizCur = next;
+  renderWizard();
+}
+function wizFillFirst(pred, emptyMsg) {
+  const idx = chPool.findIndex((s, i) => pred(s) && (wizUsedBy(i) < 0 || wizUsedBy(i) === wizCur));
+  if (idx < 0) { $('wizProgress').textContent = emptyMsg; return; }
+  wizAnswer(idx);
+}
+$('wizOldestBtn').addEventListener('click', () => wizFillFirst(() => true, '没有可选的最老歌曲了。'));
+$('wizNewestBtn').addEventListener('click', () => {
+  for (let i = chPool.length - 1; i >= 0; i--) {
+    const usedBy = wizUsedBy(i);
+    if (usedBy < 0 || usedBy === wizCur) { wizAnswer(i); return; }
+  }
+  $('wizProgress').textContent = '没有可选的最新歌曲了。';
+});
+$('wizRandomBtn').addEventListener('click', () => {
+  const free = chPool.map((s, i) => i).filter((i) => { const u = wizUsedBy(i); return u < 0 || u === wizCur; });
+  if (!free.length) { $('wizProgress').textContent = '没有可选的歌曲了。'; return; }
+  wizAnswer(free[Math.floor(Math.random() * free.length)]);
+});
+$('wizClearBtn').addEventListener('click', () => { wizAnswers[wizCur] = null; renderWizard(); });
+$('wizPrevBtn').addEventListener('click', () => { if (wizCur > 0) { wizCur--; $('wizSearch').value = ''; renderWizard(); } });
+$('wizNextBtn').addEventListener('click', () => { if (wizCur < 29) { wizCur++; $('wizSearch').value = ''; renderWizard(); } });
+$('wizSearch').addEventListener('input', renderWizard);
+$('wizCalcBtn').addEventListener('click', () => {
+  if (wizAnsweredCount() !== 30) return;
+  const picked = wizAnswers.map((i) => chPool[i]).filter(Boolean);
+  const items = PROMPTS.map((p, i) => ({ no: i + 1, prompt: p[1], song: chPool[wizAnswers[i]] }));
+  showChallengeResult(picked, items);
+});
+function setChMode(mode) {
+  const wiz = mode === 'wizard';
+  $('chWizardMode').classList.toggle('hidden', !wiz);
+  $('chFreeMode').classList.toggle('hidden', wiz);
+  $('tabWizard').classList.toggle('active', wiz);
+  $('tabFree').classList.toggle('active', !wiz);
+  if (wiz) renderWizard(); else { renderChList(); updateChCount(); }
+}
+$('tabWizard').addEventListener('click', () => setChMode('wizard'));
+$('tabFree').addEventListener('click', () => setChMode('free'));

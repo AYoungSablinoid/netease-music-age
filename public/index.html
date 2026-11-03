@@ -85,24 +85,58 @@
     <div id="recordBox"><p class="recordNote">正在读取听歌排行…</p></div>
 
     <h3>30 首手选挑战（可选）</h3>
-    <p class="recordNote">这正是原版「30 MUSIC CHALLENGE」的玩法：从这次算过的歌里亲手挑 30 首最能代表你的歌，再算一次——全量歌单是「真实品味」，手选 30 首是「你心中的代表作」，两个分数对比着看。</p>
+    <p class="recordNote">原版「30 MUSIC CHALLENGE」是 30 个命题逐题选歌，这里照着做了：命题向导（30 个命题，一题一首）和自由选两种模式，都从这次算过的歌里挑——全量歌单是「真实品味」，手选 30 首是「你心中的代表作」，两个分数对比着看。</p>
     <button id="challengeOpenBtn" class="secondary" type="button">开始手选 30 首</button>
     <div id="challengeBox" class="hidden">
-      <div class="selActions">
-        <button type="button" class="mini" id="chOldest">参考：最老的 30 首</button>
-        <button type="button" class="mini" id="chNewest">参考：最新的 30 首</button>
-        <button type="button" class="mini" id="chTop">参考：历史最爱 30 首</button>
-        <button type="button" class="mini" id="chClear">清空</button>
+      <div class="chTabs">
+        <button type="button" class="chTab active" id="tabWizard">命题向导（原站玩法）</button>
+        <button type="button" class="chTab" id="tabFree">自由选 30 首</button>
       </div>
-      <input id="chSearch" type="text" placeholder="搜索歌名或歌手，筛选候选歌曲">
-      <div class="selSummary" id="chCount"></div>
-      <div id="chList"></div>
-      <button id="chCalcBtn" type="button" disabled>算我的手选音乐年龄</button>
+
+      <div id="chWizardMode">
+        <p class="recordNote">和原站「30 MUSIC CHALLENGE」一样：一共 30 个命题，一题一首歌，逐题作答。每题在下面的候选（来自这次计算的歌单和听歌排行）里搜索点选，也可以一键用最老/最新/随机一首先填上；点上方格子可以跳回任意一题修改。同一首歌只能用一次。</p>
+        <div class="wizSlots" id="wizSlots"></div>
+        <div class="selSummary" id="wizProgress"></div>
+        <div class="wizCard">
+          <div class="wizHead"><span id="wizStep"></span><span class="tag" id="wizCat"></span></div>
+          <div class="wizPrompt" id="wizPrompt"></div>
+          <div class="wizCurrent" id="wizCurrent"></div>
+        </div>
+        <input id="wizSearch" type="text" placeholder="为这一题搜索歌名或歌手">
+        <div id="wizList"></div>
+        <div class="selActions">
+          <button type="button" class="mini" id="wizOldestBtn">填最老的一首</button>
+          <button type="button" class="mini" id="wizNewestBtn">填最新的一首</button>
+          <button type="button" class="mini" id="wizRandomBtn">随机一首</button>
+          <button type="button" class="mini" id="wizClearBtn">清除本题</button>
+        </div>
+        <div class="selActions">
+          <button type="button" class="mini" id="wizPrevBtn">← 上一题</button>
+          <button type="button" class="mini" id="wizNextBtn">下一题 →</button>
+        </div>
+        <div id="wizAnswers"></div>
+        <button id="wizCalcBtn" type="button" disabled>答满 30 题，算我的命题音乐年龄</button>
+      </div>
+
+      <div id="chFreeMode" class="hidden">
+        <div class="selActions">
+          <button type="button" class="mini" id="chOldest">参考：最老的 30 首</button>
+          <button type="button" class="mini" id="chNewest">参考：最新的 30 首</button>
+          <button type="button" class="mini" id="chTop">参考：历史最爱 30 首</button>
+          <button type="button" class="mini" id="chClear">清空</button>
+        </div>
+        <input id="chSearch" type="text" placeholder="搜索歌名或歌手，筛选候选歌曲">
+        <div class="selSummary" id="chCount"></div>
+        <div id="chList"></div>
+        <button id="chCalcBtn" type="button" disabled>算我的手选音乐年龄</button>
+      </div>
+
       <div id="chResult" class="hidden">
         <div class="ageNum small"><span id="chAge"></span><span class="ageUnit">岁</span></div>
         <div class="ageLabel" id="chLabel"></div>
         <div class="ageMedian" id="chMeta"></div>
         <p class="verdict" id="chCompare"></p>
+        <div id="chBreakdown"></div>
       </div>
     </div>
 
