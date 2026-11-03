@@ -293,11 +293,28 @@ async function qqAlbumYear(mid) {
   qqYearCache.set(mid, year);
   return year;
 }
+async function resolveQQShareCli(token) {
+  const r = await fetch(`https://c6.y.qq.com/base/fcgi-bin/u?__=${encodeURIComponent(token)}`, { headers: { 'User-Agent': QQ_HEADERS['User-Agent'] } });
+  const finalUrl = r.url || '';
+  try { await r.body.cancel(); } catch (e) { /* 忽略 */ }
+  let m = finalUrl.match(/playlist\/(\d+)/);
+  if (m) return { playlistId: m[1] };
+  m = finalUrl.match(/profile\/([\w*+=-]+)/) || finalUrl.match(/[?&](?:uin|hostuin)=([\w*+=-]+)/);
+  if (m) return { uin: decodeURIComponent(m[1]) };
+  return null;
+}
 async function mainQQ(input, optList) {
   const s = String(input || '').trim();
   let playlistId = null;
   let uin = null;
-  let m = s.match(/playlist\/(\d+)/) || s.match(/[?&](?:disstid|id)=(\d+)/);
+  let m = s.match(/[?&]__=([\w=-]{4,128})/);
+  if (m) {
+    // QQ 音乐 App 分享链接（u?__= 跳转）：先解析落点
+    const r = await resolveQQShareCli(m[1]);
+    if (!r) throw new Error('这个分享链接解析不出歌单或用户（可能已过期）。');
+    if (r.playlistId) playlistId = r.playlistId; else uin = r.uin;
+  }
+  m = s.match(/playlist\/(\d+)/) || s.match(/[?&](?:disstid|id)=(\d+)/);
   if (m && /qq\.com/.test(s)) playlistId = m[1];
   else if ((m = s.match(/profile\/([\w*+=-]+)/))) uin = decodeURIComponent(m[1]);
   else if (/^\d{5,11}$/.test(s) || /^[\w*=-]{8,64}$/.test(s)) uin = s;

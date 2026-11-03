@@ -170,7 +170,7 @@ const PLATFORM_UI = {
   qq: {
     label: 'QQ 号 / QQ 音乐主页或歌单链接',
     placeholder: '填 QQ 号，或粘贴 QQ 音乐个人主页链接 / 歌单链接',
-    hint: '可以填 QQ 号、QQ 音乐 App 分享的个人主页链接，或任意公开歌单的链接（直接按这个歌单计算）。<br>注意：QQ 音乐的「我喜欢」需要登录才能读取，暂不支持；可计算的是公开的自建歌单和歌单链接。',
+    hint: '可以填 QQ 号、QQ 音乐 App 分享的个人主页链接，或任意公开歌单的链接（直接按这个歌单计算）；App 里复制出来的分享链接（c6.y.qq.com 开头）也可以直接粘贴。<br>注意：QQ 音乐的「我喜欢」需要登录才能读取，暂不支持；可计算的是公开的自建歌单和歌单链接。',
     empty: '请先填写 QQ 号或粘贴 QQ 音乐链接。',
   },
   kuwo: {
@@ -211,10 +211,12 @@ function parseKugouInput(raw) {
   return {};
 }
 
-// 从 QQ 音乐输入里解析出目标：歌单链接 -> {playlistId}；主页链接/QQ号/加密uin -> {uin}
+// 从 QQ 音乐输入里解析出目标：歌单链接 -> {playlistId}；主页链接/QQ号/加密uin -> {uin}；App 分享跳转链接 -> {shareToken}
 function parseQQInput(raw) {
   const s = String(raw || '').trim();
-  let m = s.match(/playlist\/(\d+)/) || s.match(/[?&](?:disstid|id)=(\d+)/);
+  let m = s.match(/[?&]__=([\w=-]{4,128})/);
+  if (m) return { shareToken: m[1] };
+  m = s.match(/playlist\/(\d+)/) || s.match(/[?&](?:disstid|id)=(\d+)/);
   if (m && /qq\.com|y\.qq/.test(s)) return { playlistId: m[1] };
   if (/^\d{10,}$/.test(s) && /playlist/.test(s)) return { playlistId: s };
   m = s.match(/profile\/([\w*+=-]+)/);
@@ -246,24 +248,45 @@ form.addEventListener('submit', async (ev) => {
   try {
     currentPlatform = platform;
     if (platform === 'qq') {
-      const target = parseQQInput(link);
-      if (target.playlistId) {
+      let target = parseQQInput(link);
+      if (target.shareToken) {
+        // App 分享链接（u?__= 跳转）：先问后端它的落点是歌单还是用户主页
+        progress1.show('正在解析分享链接…', 30);
+        const r = await getJson('/api/qq/resolve-share?token=' + encodeURIComponent(target.shareToken));
+        target = r.type === 'playlist' ? { playlistId: r.id } : { uin: r.uin };
+      }
+      const loadQQPlaylist = async (pid) => {
         // 歌单链接：直接把这个歌单作为唯一可选项进入第二步
         progress1.show('正在读取歌单…', 40);
-        const data = await getJson('/api/qq/playlist?id=' + encodeURIComponent(target.playlistId));
-        currentUid = 'qq-playlist-' + target.playlistId;
+        const data = await getJson('/api/qq/playlist?id=' + encodeURIComponent(pid));
+        currentUid = 'qq-playlist-' + pid;
         currentUser = {
           nickname: 'QQ 音乐歌单',
           avatarUrl: '',
           level: null,
-          playlists: [{ id: target.playlistId, name: data.name, trackCount: data.songs.length, coverImgUrl: '', creatorName: '', kind: 'own' }],
+          playlists: [{ id: pid, name: data.name, trackCount: data.songs.length, coverImgUrl: '', creatorName: '', kind: 'own' }],
         };
+      };
+      if (target.playlistId) {
+        await loadQQPlaylist(target.playlistId);
       } else if (target.uin) {
         progress1.show('正在读取歌单列表…', 60);
-        currentUid = target.uin;
-        currentUser = await getJson('/api/qq/user?uin=' + encodeURIComponent(target.uin));
+        try {
+          currentUser = await getJson('/api/qq/user?uin=' + encodeURIComponent(target.uin));
+          currentUid = target.uin;
+        } catch (e) {
+          // 只粘了分享口令（__= 后面的 token）时会被误当加密 uin、接口报 code=2000：
+          // 回退按分享链接解析一次，成功就继续，失败则报原始错误
+          if (/^\d{5,11}$/.test(target.uin)) throw e;
+          const r = await getJson('/api/qq/resolve-share?token=' + encodeURIComponent(link.trim())).catch(() => null);
+          if (r && r.type === 'playlist') await loadQQPlaylist(r.id);
+          else if (r && r.type === 'user') {
+            currentUid = r.uin;
+            currentUser = await getJson('/api/qq/user?uin=' + encodeURIComponent(r.uin));
+          } else throw e;
+        }
       } else {
-        throw new Error('无法识别这个输入：请填 QQ 号，或粘贴 QQ 音乐个人主页 / 歌单链接。');
+        throw new Error('无法识别这个输入：请填 QQ 号，或粘贴 QQ 音乐个人主页 / 歌单链接 / App 分享链接。');
       }
     } else if (platform === 'kugou') {
       const target = parseKugouInput(link);

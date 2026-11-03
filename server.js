@@ -12,6 +12,7 @@
  *   POST /api/songs {ids:[..]}  批量取歌曲发行年份（单次 <= 1000 首）
  *   POST /api/original-years    对重制/再版/精选专辑的歌，查同歌手同名歌曲的最早发行年份
  *   GET  /api/qq/user?uin=...   QQ 音乐用户公开自建歌单（uin 可为 QQ 号或主页加密 uin）
+ *   GET  /api/qq/resolve-share?token=...  解析 QQ 音乐 App 分享链接（u?__= 跳转）的落点：歌单或用户
  *   GET  /api/qq/playlist?id=.. QQ 音乐歌单全部歌曲（含专辑 mid，不含年份）
  *   POST /api/qq/album-years    按专辑 mid 批量补发行年份 {mids:[..]}（单次 <= 100）
  *   GET  /api/kuwo/user?uid=... 酷我用户公开歌单（老服务按 uid 列单，含「我喜欢听」）
@@ -515,6 +516,33 @@ async function qqAlbumYear(albummid) {
   return year;
 }
 
+// QQ 音乐 App 的分享链接是 c6.y.qq.com/base/fcgi-bin/u?__=<token> 形式的跳转链接，
+// 本身不带歌单/用户 ID；跟着跳转走，最终落点 URL 里才有 /playlist/<id> 或 uin。
+// 用户只粘 __ 后面的 token 时也会走到这里（token 会先被误当加密 uin、接口报 code=2000，前端再回退到本接口）。
+async function resolveQQShare(token) {
+  const r = await withTimeout(fetch(`https://c6.y.qq.com/base/fcgi-bin/u?__=${encodeURIComponent(token)}`, {
+    headers: { 'User-Agent': QQ_HEADERS['User-Agent'] },
+  }), 20000, 'QQ分享链接解析');
+  const finalUrl = r.url || '';
+  try { await r.body.cancel(); } catch (e) { /* 忽略 */ }
+  let m = finalUrl.match(/playlist\/(\d+)/);
+  if (m) return { type: 'playlist', id: m[1] };
+  m = finalUrl.match(/profile\/([\w*+=-]+)/) || finalUrl.match(/[?&](?:uin|hostuin)=([\w*+=-]+)/);
+  if (m) return { type: 'user', uin: decodeURIComponent(m[1]) };
+  return null;
+}
+
+async function handleQQResolveShare(res, token) {
+  if (!token || !/^[\w=-]{4,128}$/.test(token)) return sendJson(res, 400, { error: '分享口令格式不对' });
+  try {
+    const r = await resolveQQShare(token);
+    if (!r) return sendJson(res, 404, { error: '这个分享链接解析不出歌单或用户（可能已过期）' });
+    sendJson(res, 200, r);
+  } catch (e) {
+    sendJson(res, 502, { error: `QQ音乐接口出错：${e.message}` });
+  }
+}
+
 async function handleQQUser(res, uin) {
   if (!uin || !/^[\w*=-]{3,64}$/.test(uin)) return sendJson(res, 400, { error: 'QQ 号或主页标识不合法' });
   try {
@@ -846,6 +874,7 @@ const server = http.createServer(async (req, res) => {
   if (pathname === '/api/songs' && req.method === 'POST') return handleSongs(req, res);
   if (pathname === '/api/original-years' && req.method === 'POST') return handleOriginalYears(req, res);
   if (pathname === '/api/qq/user' && req.method === 'GET') return handleQQUser(res, url.searchParams.get('uin'));
+  if (pathname === '/api/qq/resolve-share' && req.method === 'GET') return handleQQResolveShare(res, url.searchParams.get('token'));
   if (pathname === '/api/qq/playlist' && req.method === 'GET') return handleQQPlaylist(res, url.searchParams.get('id'));
   if (pathname === '/api/qq/album-years' && req.method === 'POST') return handleQQAlbumYears(req, res);
   if (pathname === '/api/kuwo/user' && req.method === 'GET') return handleKuwoUser(res, url.searchParams.get('uid'));
