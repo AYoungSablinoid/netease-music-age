@@ -1,6 +1,23 @@
 'use strict';
 const CURRENT_YEAR = new Date().getFullYear();
-const BATCH = 500;
+const BATCH = 1000;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// 有上限的并发池：按原顺序返回结果，任一任务失败则整体失败（与原来串行时的报错行为一致）
+async function mapPool(items, conc, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  let failed = null;
+  const worker = async () => {
+    while (next < items.length && !failed) {
+      const i = next++;
+      try { out[i] = await fn(items[i], i); } catch (e) { failed = e; }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(conc, items.length) }, worker));
+  if (failed) throw failed;
+  return out;
+}
 
 const $ = (id) => document.getElementById(id);
 const form = $('ageForm');
@@ -14,6 +31,7 @@ let currentUid = null;
 let lastSongs = []; // 最近一次主计算计入的歌曲（分享图和手选挑战都用它）
 let lastResult = null; // 最近一次主结果的汇总数据
 let lastRecordSongs = []; // 听歌排行里的歌曲（周榜+累计榜并集，带年份），用作手选挑战的候选补充
+let recordPromise = null; // 听歌排行加载的 Promise：打开手选挑战前要等它完成，否则候选池会缺排行里的歌
 let lastTopSongs = []; // 历史最爱榜的歌曲（按播放顺序）
 
 // 中位数音乐年龄：把每首歌的单曲年龄排序取中间值。
@@ -135,7 +153,7 @@ async function correctSongs(list, onProgress) {
       if (onProgress) onProgress(processed, flaggedTotal);
     }
   };
-  await Promise.all(Array.from({ length: Math.min(2, chunks.length) }, worker));
+  await Promise.all(Array.from({ length: Math.min(3, chunks.length) }, worker));
   return corrected;
 }
 
@@ -239,34 +257,55 @@ $('calcBtn').addEventListener('click', async () => {
   resultCard.classList.add('hidden');
   $('calcBtn').disabled = true;
   try {
-    // 拉取各歌单 trackIds 并去重
+    // 拉取各歌单 trackIds 并去重：4 个歌单并发拉（歌单多的用户串行要等几分钟）；
+    // 单个歌单失败不中断整体（300 个歌单里总有一两个会碰上接口抖动），失败的记下来在结果里注明
     const idSet = new Set();
     let rawTotal = 0;
-    for (let i = 0; i < sel.length; i++) {
-      progress2.show(`正在读取歌单「${sel[i].name}」…`, (i / sel.length) * 35, `第 ${i + 1} / ${sel.length} 个歌单`);
-      const data = await getJson('/api/playlist?id=' + encodeURIComponent(sel[i].id));
-      rawTotal += data.trackIds.length;
-      for (const id of data.trackIds) idSet.add(id);
+    let plDone = 0;
+    progress2.show('正在读取所选歌单…', 0, `共 ${sel.length} 个歌单`);
+    const plResults = await mapPool(sel, 4, async (p) => {
+      try {
+        return { name: p.name, data: await getJson('/api/playlist?id=' + encodeURIComponent(p.id)) };
+      } catch (e) {
+        return { name: p.name, error: e };
+      } finally {
+        plDone++;
+        progress2.show('正在读取所选歌单…', (plDone / sel.length) * 35, `已读取 ${plDone} / ${sel.length} 个歌单`);
+      }
+    });
+    const failedPlaylists = [];
+    for (const r of plResults) {
+      if (r.error) { failedPlaylists.push(r.name); continue; }
+      rawTotal += r.data.trackIds.length;
+      for (const id of r.data.trackIds) idSet.add(id);
     }
     const ids = [...idSet];
     if (!ids.length) throw new Error('所选歌单里没有歌曲，无法计算。');
 
-    // 分批查发行年份
+    // 分批查发行年份：1000 首一批、3 批并发（4 万首歌时串行要几分钟）
     const songs = [];
     let noYear = 0;
-    for (let i = 0; i < ids.length; i += BATCH) {
-      const batch = ids.slice(i, i + BATCH);
-      const { songs: part } = await getJson('/api/songs', {
+    const batches = [];
+    for (let i = 0; i < ids.length; i += BATCH) batches.push(ids.slice(i, i + BATCH));
+    let batchDone = 0;
+    const parts = await mapPool(batches, 3, async (batch) => {
+      const post = () => getJson('/api/songs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ids: batch }),
       });
+      let part;
+      try { ({ songs: part } = await post()); }
+      catch (e) { await sleep(1500); ({ songs: part } = await post()); } // 整批失败多半是瞬时抖动，隔一会重试一次
+      batchDone++;
+      progress2.show('正在查每首歌的发行年份…', 35 + (batchDone / batches.length) * 55, `已处理 ${Math.min(batchDone * BATCH, ids.length)} / ${ids.length} 首（去重后）`);
+      return part;
+    });
+    for (const part of parts) {
       for (const s of part) {
         if (s.year) songs.push({ ...s });
         else noYear++;
       }
-      const done = Math.min(i + BATCH, ids.length);
-      progress2.show('正在查每首歌的发行年份…', 35 + (done / ids.length) * 55, `已处理 ${done} / ${ids.length} 首（去重后）`);
     }
     if (!songs.length) throw new Error('没有取到任何带发行年份的歌曲，无法计算。');
     // 校正重制/再版歌曲的年份（专辑年份会把结果算小），再统一换算单曲年龄
@@ -275,7 +314,7 @@ $('calcBtn').addEventListener('click', async () => {
       progress2.show('正在校正重制/再版歌曲的发行年份…', 95, `已检查 ${doneN} / ${totalN} 首疑似歌曲`));
     for (const s of songs) s.age = CURRENT_YEAR - s.year + 17;
     progress2.show('正在计算…', 100);
-    renderResult(currentUser, sel, songs, noYear, rawTotal, ids.length, { correctedCount, ageBeforeCorrection });
+    renderResult(currentUser, sel, songs, noYear, rawTotal, ids.length, { correctedCount, ageBeforeCorrection, failedPlaylists });
   } catch (e) {
     showError($('errorBox2'), e.message || '出错了，请重试。');
   } finally {
@@ -297,8 +336,7 @@ function renderResult(user, selPlaylists, songs, noYear, rawTotal, uniqueTotal, 
   $('challengeBox').classList.add('hidden');
   $('chResult').classList.add('hidden');
   chSelected.clear();
-  wizAnswers = new Array(30).fill(null);
-  wizCur = 0;
+  resetWizard();
   const sorted = [...songs].sort((a, b) => a.year - b.year);
   const oldest = sorted[0];
   const newest = sorted[sorted.length - 1];
@@ -346,14 +384,17 @@ function renderResult(user, selPlaylists, songs, noYear, rawTotal, uniqueTotal, 
 
   $('rArtists').textContent = topArtists.map(([a, c]) => `${a}（${c} 首）`).join('、');
   const dupNote = rawTotal > uniqueTotal ? `所选歌单原始合计 ${rawTotal} 首，去重后 ${uniqueTotal} 首；` : '';
+  const failNote = correction && correction.failedPlaylists && correction.failedPlaylists.length
+    ? `另有 ${correction.failedPlaylists.length} 个歌单读取失败、未计入：${correction.failedPlaylists.slice(0, 5).join('、')}${correction.failedPlaylists.length > 5 ? ' 等' : ''}；`
+    : '';
   const corrNote = correction && correction.correctedCount
     ? `其中 ${correction.correctedCount} 首来自重制/再版/精选专辑，已按原版发行年份校正（不校正会算成 ${correction.ageBeforeCorrection} 岁）；`
     : '';
-  $('rFoot').textContent = `${dupNote}${corrNote}参与计算 ${songs.length} 首，平均音乐年龄 ${avg.toFixed(1)} 岁（四舍五入为 ${musicAge} 岁），中位数音乐年龄 ${medianAge} 岁；另有 ${noYear} 首因缺发行年份未计入。单曲音乐年龄 = ${CURRENT_YEAR} − 发行年份 + 17。`;
+  $('rFoot').textContent = `${dupNote}${failNote}${corrNote}参与计算 ${songs.length} 首，平均音乐年龄 ${avg.toFixed(1)} 岁（四舍五入为 ${musicAge} 岁），中位数音乐年龄 ${medianAge} 岁；另有 ${noYear} 首因缺发行年份未计入。单曲音乐年龄 = ${CURRENT_YEAR} − 发行年份 + 17。`;
 
   resultCard.classList.remove('hidden');
   resultCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  loadRecordPanels(musicAge);
+  recordPromise = loadRecordPanels(musicAge);
 }
 
 // ---------- 听歌排行视角：历史最爱 Top100 + 最近一周 ----------
@@ -435,9 +476,9 @@ $('againBtn').addEventListener('click', () => {
   lastResult = null;
   lastRecordSongs = [];
   lastTopSongs = [];
+  recordPromise = null;
   chSelected.clear();
-  wizAnswers = new Array(30).fill(null);
-  wizCur = 0;
+  resetWizard();
   input.value = '';
   input.focus();
   window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -542,9 +583,11 @@ $('shareBtn').addEventListener('click', () => {
 
 // ---------- 30 首手选挑战 ----------
 // 候选池 = 这次主计算计入的歌 + 听歌排行里的歌（按歌曲 ID 合并去重），按年份从老到新列出，
-// 另给三个参考歌单一键预选：最老的 30 首 / 最新的 30 首 / 历史最爱 30 首。选满 30 首才能计算。
+// 另给三个参考歌单一键预选：最老的 / 最新的 / 历史最爱（按当前挑战长度截取）。选满挑战长度才能计算。
 const chSelected = new Set();
 let chPool = [];
+let chTarget = 20; // 挑战长度：可选 10 / 20 / 30（30 是原版长度），向导和自由选共用
+let lastChallenge = null; // 最近一次挑战结果（挑战分享图用）
 function buildChPool() {
   const byId = new Map();
   for (const s of [...lastSongs, ...lastRecordSongs]) {
@@ -556,9 +599,9 @@ function updateChCount(extraMsg) {
   const n = chSelected.size;
   $('chCount').textContent =
     (extraMsg ? extraMsg + ' ' : '') +
-    `候选 ${chPool.length} 首（来自这次计算的歌单和听歌排行），已选 ${n} / 30 首` +
-    (n === 30 ? '，可以计算了' : n > 30 ? '，多了，请取消几首' : `，还差 ${30 - n} 首`);
-  $('chCalcBtn').disabled = n !== 30;
+    `候选 ${chPool.length} 首（来自这次计算的歌单和听歌排行，可手动添加），已选 ${n} / ${chTarget} 首` +
+    (n === chTarget ? '，可以计算了' : n > chTarget ? '，多了，请取消几首' : `，还差 ${chTarget - n} 首`);
+  $('chCalcBtn').disabled = n !== chTarget;
 }
 function renderChList() {
   const q = $('chSearch').value.trim().toLowerCase();
@@ -599,14 +642,24 @@ function chQuickPick(songs, emptyMsg) {
   for (const s of songs) {
     const idx = idxById.get(s.id);
     if (idx != null) chSelected.add(idx);
-    if (chSelected.size >= 30) break;
+    if (chSelected.size >= chTarget) break;
   }
   $('chSearch').value = '';
   renderChList();
   updateChCount();
 }
-$('challengeOpenBtn').addEventListener('click', () => {
+$('challengeOpenBtn').addEventListener('click', async () => {
   if (!lastSongs.length) return;
+  // 听歌排行还在加载时先等它完成再建候选池，否则池子会缺排行里的歌（之前点开太快只有歌单候选）
+  if (recordPromise) {
+    const btn = $('challengeOpenBtn');
+    const oldText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '正在合并听歌排行候选…';
+    try { await recordPromise; } catch (e) { /* 排行加载失败不阻断挑战，用现有候选 */ }
+    btn.disabled = false;
+    btn.textContent = oldText;
+  }
   buildChPool();
   $('challengeBox').classList.remove('hidden');
   $('chResult').classList.add('hidden');
@@ -616,9 +669,9 @@ $('challengeOpenBtn').addEventListener('click', () => {
   $('challengeBox').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 });
 $('chSearch').addEventListener('input', renderChList);
-$('chOldest').addEventListener('click', () => chQuickPick([...chPool].sort((a, b) => a.year - b.year).slice(0, 30)));
-$('chNewest').addEventListener('click', () => chQuickPick([...chPool].sort((a, b) => b.year - a.year).slice(0, 30)));
-$('chTop').addEventListener('click', () => chQuickPick(lastTopSongs.slice(0, 30), '这个用户的听歌排行未公开或还没加载完，暂时没有「历史最爱」参考歌单。'));
+$('chOldest').addEventListener('click', () => chQuickPick([...chPool].sort((a, b) => a.year - b.year).slice(0, chTarget)));
+$('chNewest').addEventListener('click', () => chQuickPick([...chPool].sort((a, b) => b.year - a.year).slice(0, chTarget)));
+$('chTop').addEventListener('click', () => chQuickPick(lastTopSongs.slice(0, chTarget), '这个用户的听歌排行未公开或还没加载完，暂时没有「历史最爱」参考歌单。'));
 $('chClear').addEventListener('click', () => { chSelected.clear(); renderChList(); updateChCount(); });
 function showChallengeResult(picked, breakdownItems) {
   const avg = picked.reduce((a, s) => a + (CURRENT_YEAR - s.year + 17), 0) / picked.length;
@@ -637,6 +690,8 @@ function showChallengeResult(picked, breakdownItems) {
     else if (d <= -1) cmp = `比歌单全量结果（${lastResult.musicAge} 岁）年轻 ${-d} 岁：你心中的代表作，比日常歌单更年轻。`;
   }
   $('chCompare').textContent = cmp;
+  lastChallenge = { picked, breakdownItems, musicAge, avg, median, cmp };
+  $('chShareBox').classList.add('hidden');
   const bd = $('chBreakdown');
   bd.innerHTML = '';
   if (breakdownItems && breakdownItems.length) {
@@ -661,10 +716,103 @@ function showChallengeResult(picked, breakdownItems) {
   $('chResult').classList.remove('hidden');
   $('chResult').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
+
+// 挑战分享图：大字年龄 + 对比结论 + 全部选歌清单（向导模式带命题），1080 宽 PNG
+$('chShareBtn').addEventListener('click', () => {
+  if (!lastChallenge) return;
+  const C = lastChallenge;
+  const FONT = '"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif';
+  const wizard = !!(C.breakdownItems && C.breakdownItems.length);
+  const rows = wizard
+    ? C.breakdownItems.map((it) => ({ head: `${it.no}. ${it.prompt}`, main: `${it.song.name} — ${it.song.artist}`, sub: `${it.song.year} 年 · 单曲 ${CURRENT_YEAR - it.song.year + 17} 岁` }))
+    : C.picked.map((s, i) => ({ head: '', main: `${i + 1}. ${s.name} — ${s.artist}`, sub: `${s.year} 年 · 单曲 ${CURRENT_YEAR - s.year + 17} 岁` }));
+  const rowH = wizard ? 92 : 64;
+  const W = 1080;
+  const canvas = document.createElement('canvas');
+  canvas.width = W;
+  const ctx = canvas.getContext('2d');
+  ctx.font = `32px ${FONT}`;
+  const cmpLines = wrapLines(ctx, C.cmp, W - 220, 2);
+  const H = 700 + (cmpLines.length > 1 ? 45 : 0) + rows.length * rowH + 130;
+  canvas.height = H; // 设高会重置画布状态，下面的绘制都会显式重设字体/对齐
+  ctx.fillStyle = '#f6f6f8'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#ffffff'; rr(ctx, 40, 40, W - 80, H - 80, 36); ctx.fill();
+  ctx.strokeStyle = '#e7e7ec'; ctx.lineWidth = 2; rr(ctx, 40, 40, W - 80, H - 80, 36); ctx.stroke();
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#8a8f98'; ctx.font = `600 34px ${FONT}`;
+  ctx.fillText(wizard ? '命 题 手 选 挑 战' : '手 选 挑 战', W / 2, 140);
+  ctx.fillStyle = '#22242a'; ctx.font = `700 52px ${FONT}`;
+  ctx.fillText(wrapLines(ctx, lastResult ? lastResult.nickname : '', W - 240, 1)[0] || '', W / 2, 215);
+  ctx.fillStyle = '#e60026'; ctx.font = `800 230px ${FONT}`;
+  const ageW = ctx.measureText(String(C.musicAge)).width;
+  ctx.fillText(String(C.musicAge), W / 2 - 40, 450);
+  ctx.font = `600 52px ${FONT}`;
+  ctx.fillText('岁', W / 2 - 40 + ageW / 2 + 52, 450);
+  ctx.fillStyle = '#22242a'; ctx.font = `600 42px ${FONT}`;
+  ctx.fillText(generationLabel(C.musicAge), W / 2, 525);
+  ctx.fillStyle = '#8a8f98'; ctx.font = `32px ${FONT}`;
+  ctx.fillText(`手选 ${C.picked.length} 首 · 平均 ${C.avg.toFixed(1)} 岁 · 中位数 ${C.median} 岁`, W / 2, 580);
+  cmpLines.forEach((line, i) => ctx.fillText(line, W / 2, 625 + i * 45));
+  const divY = 660 + (cmpLines.length > 1 ? 45 : 0);
+  ctx.strokeStyle = '#e7e7ec'; ctx.beginPath(); ctx.moveTo(110, divY); ctx.lineTo(W - 110, divY); ctx.stroke();
+  let y = divY + 55;
+  ctx.textAlign = 'left';
+  for (const r of rows) {
+    if (r.head) {
+      ctx.fillStyle = '#8a8f98'; ctx.font = `28px ${FONT}`;
+      ctx.fillText(wrapLines(ctx, r.head, W - 220, 1)[0] || '', 110, y);
+      y += 38;
+    }
+    ctx.fillStyle = '#22242a'; ctx.font = `600 32px ${FONT}`;
+    const mainLines = wrapLines(ctx, r.main, W - 380, 1);
+    ctx.fillText(mainLines[0] || '', 110, y);
+    ctx.fillStyle = '#8a8f98'; ctx.font = `30px ${FONT}`;
+    ctx.textAlign = 'right';
+    ctx.fillText(r.sub, W - 110, y);
+    ctx.textAlign = 'left';
+    y += rowH - (r.head ? 38 : 0);
+  }
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#8a8f98'; ctx.font = `30px ${FONT}`;
+  ctx.fillText('netease-music-age.onrender.com', W / 2, H - 78);
+  const done = (url) => {
+    $('chShareImg').src = url;
+    $('chShareDownload').href = url;
+    $('chShareBox').classList.remove('hidden');
+    $('chShareBox').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  };
+  if (canvas.toBlob) canvas.toBlob((b) => { if (b) done(URL.createObjectURL(b)); else done(canvas.toDataURL('image/png')); }, 'image/png');
+  else done(canvas.toDataURL('image/png'));
+});
 $('chCalcBtn').addEventListener('click', () => {
   const picked = [...chSelected].map((i) => chPool[i]).filter(Boolean);
-  if (picked.length !== 30) return;
+  if (picked.length !== chTarget) return;
   showChallengeResult(picked, null);
+});
+
+// 手动添加歌曲：候选里没有的歌（如流媒体上找不到的宝藏歌）由用户自己填歌名/音乐人/年份。
+// 加到候选池末尾（不重排，保证已选下标不错位）；池里已有同名同歌手则直接复用那首。
+let customSeq = 0;
+function addCustomSong(name, artist, year) {
+  name = String(name || '').trim();
+  artist = String(artist || '').trim();
+  year = Number(year);
+  if (!name || !artist || !Number.isInteger(year) || year < 1900 || year > CURRENT_YEAR) return -1;
+  const dup = chPool.findIndex((s) => s.name.toLowerCase() === name.toLowerCase() && s.artist.toLowerCase() === artist.toLowerCase());
+  if (dup >= 0) return dup;
+  chPool.push({ id: 'custom-' + (++customSeq), name, artist, album: '手动添加', year, custom: true });
+  return chPool.length - 1;
+}
+$('chCustomBtn').addEventListener('click', () => {
+  const idx = addCustomSong($('chCustomName').value, $('chCustomArtist').value, $('chCustomYear').value);
+  if (idx < 0) { $('chCustomMsg').textContent = '请填写歌名、音乐人，以及 1900–' + CURRENT_YEAR + ' 之间的发行年份。'; return; }
+  if (!chSelected.has(idx) && chSelected.size >= chTarget) { $('chCustomMsg').textContent = '已选满，先取消一首再添加。'; return; }
+  $('chCustomMsg').textContent = '';
+  $('chCustomName').value = ''; $('chCustomArtist').value = ''; $('chCustomYear').value = '';
+  chSelected.add(idx);
+  $('chSearch').value = '';
+  renderChList();
+  updateChCount();
 });
 
 // ---------- 命题向导（参考原站 30 MUSIC CHALLENGE：一题一首、逐题作答） ----------
@@ -702,10 +850,24 @@ const PROMPTS = [
   ['回忆与喜好', '流媒体上找不到的宝藏歌'],
   ['回忆与喜好', '你自己的主题曲'],
 ];
-let wizAnswers = new Array(30).fill(null); // 每题选中的候选下标（chPool 下标），null 为未答
+let wizAnswers = []; // 每题选中的候选下标（chPool 下标），null 为未答；长度 = 当前挑战长度
 let wizCur = 0;
+let wizPrompts = []; // 当前长度下实际使用的命题（从 30 题里均匀抽取，首尾固定）
+// 按挑战长度从 30 个命题里均匀抽题：10/20 题时三类命题都覆盖，最后一题始终是「你自己的主题曲」
+function pickPrompts(n) {
+  if (n >= PROMPTS.length) return PROMPTS.slice();
+  const idxs = [];
+  for (let i = 0; i < n; i++) idxs.push(Math.round((i * (PROMPTS.length - 1)) / (n - 1)));
+  return [...new Set(idxs)].map((i) => PROMPTS[i]);
+}
+function resetWizard() {
+  wizPrompts = pickPrompts(chTarget);
+  wizAnswers = new Array(wizPrompts.length).fill(null);
+  wizCur = 0;
+}
+resetWizard();
 function wizUsedBy(idx) {
-  for (let i = 0; i < 30; i++) if (wizAnswers[i] === idx) return i;
+  for (let i = 0; i < wizAnswers.length; i++) if (wizAnswers[i] === idx) return i;
   return -1;
 }
 function wizAnsweredCount() { return wizAnswers.filter((x) => x != null).length; }
@@ -713,7 +875,7 @@ function renderWizard() {
   // 进度格
   const slots = $('wizSlots');
   slots.innerHTML = '';
-  PROMPTS.forEach((p, i) => {
+  wizPrompts.forEach((p, i) => {
     const b = document.createElement('button');
     b.type = 'button';
     b.className = 'wizSlot' + (wizAnswers[i] != null ? ' filled' : '') + (i === wizCur ? ' current' : '');
@@ -730,10 +892,10 @@ function renderWizard() {
     const avg = answered.reduce((a, s) => a + (CURRENT_YEAR - s.year + 17), 0) / n;
     preview = ` · 已答歌曲当前平均音乐年龄约 ${Math.round(avg)} 岁（预览，答满后为准）`;
   }
-  $('wizProgress').textContent = `已答 ${n} / 30 题${preview}`;
+  $('wizProgress').textContent = `已答 ${n} / ${wizPrompts.length} 题${preview}`;
   // 当前命题卡
-  const [cat, prompt] = PROMPTS[wizCur];
-  $('wizStep').textContent = `第 ${wizCur + 1} / 30 题`;
+  const [cat, prompt] = wizPrompts[wizCur];
+  $('wizStep').textContent = `第 ${wizCur + 1} / ${wizPrompts.length} 题`;
   $('wizCat').textContent = cat;
   $('wizPrompt').textContent = prompt;
   const curIdx = wizAnswers[wizCur];
@@ -772,7 +934,7 @@ function renderWizard() {
   // 已答清单
   const box = $('wizAnswers');
   box.innerHTML = '';
-  PROMPTS.forEach((p, i) => {
+  wizPrompts.forEach((p, i) => {
     const ai = wizAnswers[i];
     if (ai == null) return;
     const s = chPool[ai];
@@ -792,17 +954,18 @@ function renderWizard() {
     row.append(qEl, sEl, x);
     box.appendChild(row);
   });
-  $('wizCalcBtn').disabled = wizAnsweredCount() !== 30;
+  $('wizCalcBtn').disabled = wizAnsweredCount() !== wizPrompts.length;
   $('wizPrevBtn').disabled = wizCur === 0;
-  $('wizNextBtn').disabled = wizCur === 29;
+  $('wizNextBtn').disabled = wizCur === wizPrompts.length - 1;
 }
 function wizAnswer(idx) {
   wizAnswers[wizCur] = idx;
   $('wizSearch').value = '';
   // 自动前进到下一道未答题（都答完则停留在最后一题）
+  const total = wizAnswers.length;
   let next = -1;
-  for (let k = 1; k <= 30; k++) {
-    const j = (wizCur + k) % 30;
+  for (let k = 1; k <= total; k++) {
+    const j = (wizCur + k) % total;
     if (wizAnswers[j] == null) { next = j; break; }
   }
   if (next >= 0) wizCur = next;
@@ -828,14 +991,44 @@ $('wizRandomBtn').addEventListener('click', () => {
 });
 $('wizClearBtn').addEventListener('click', () => { wizAnswers[wizCur] = null; renderWizard(); });
 $('wizPrevBtn').addEventListener('click', () => { if (wizCur > 0) { wizCur--; $('wizSearch').value = ''; renderWizard(); } });
-$('wizNextBtn').addEventListener('click', () => { if (wizCur < 29) { wizCur++; $('wizSearch').value = ''; renderWizard(); } });
+$('wizNextBtn').addEventListener('click', () => { if (wizCur < wizPrompts.length - 1) { wizCur++; $('wizSearch').value = ''; renderWizard(); } });
 $('wizSearch').addEventListener('input', renderWizard);
 $('wizCalcBtn').addEventListener('click', () => {
-  if (wizAnsweredCount() !== 30) return;
+  if (wizAnsweredCount() !== wizPrompts.length) return;
   const picked = wizAnswers.map((i) => chPool[i]).filter(Boolean);
-  const items = PROMPTS.map((p, i) => ({ no: i + 1, prompt: p[1], song: chPool[wizAnswers[i]] }));
+  const items = wizPrompts.map((p, i) => ({ no: i + 1, prompt: p[1], song: chPool[wizAnswers[i]] }));
   showChallengeResult(picked, items);
 });
+$('wizCustomBtn').addEventListener('click', () => {
+  const idx = addCustomSong($('wizCustomName').value, $('wizCustomArtist').value, $('wizCustomYear').value);
+  if (idx < 0) { $('wizCustomMsg').textContent = '请填写歌名、音乐人，以及 1900–' + CURRENT_YEAR + ' 之间的发行年份。'; return; }
+  const usedBy = wizUsedBy(idx);
+  if (usedBy >= 0 && usedBy !== wizCur) { $('wizCustomMsg').textContent = '这首歌已经用在第 ' + (usedBy + 1) + ' 题了，换一首吧。'; return; }
+  $('wizCustomMsg').textContent = '';
+  $('wizCustomName').value = ''; $('wizCustomArtist').value = ''; $('wizCustomYear').value = '';
+  wizAnswer(idx);
+});
+
+// 挑战长度切换：向导换题组、自由选换目标数，两边已选都清空
+function setChCount(n) {
+  chTarget = n;
+  document.querySelectorAll('.chCountBtn').forEach((b) => b.classList.toggle('active', Number(b.dataset.n) === n));
+  chSelected.clear();
+  resetWizard();
+  $('chOldest').textContent = `参考：最老的 ${n} 首`;
+  $('chNewest').textContent = `参考：最新的 ${n} 首`;
+  $('chTop').textContent = `参考：历史最爱 ${n} 首`;
+  $('wizCalcBtn').textContent = `答满 ${n} 题，算我的命题音乐年龄`;
+  $('tabFree').textContent = '自由选';
+  $('chResult').classList.add('hidden');
+  if (!$('challengeBox').classList.contains('hidden')) {
+    renderChList();
+    updateChCount();
+    renderWizard();
+  }
+}
+document.querySelectorAll('.chCountBtn').forEach((b) =>
+  b.addEventListener('click', () => setChCount(Number(b.dataset.n))));
 function setChMode(mode) {
   const wiz = mode === 'wizard';
   $('chWizardMode').classList.toggle('hidden', !wiz);

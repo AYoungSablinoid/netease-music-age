@@ -193,6 +193,14 @@ button.mini:hover { border-color: var(--accent); color: var(--accent); backgroun
 .resultBtns { display: flex; gap: 10px; flex-wrap: wrap; }
 .resultBtns .secondary { flex: 1; width: auto; }
 .resultBtns button { margin-top: 16px; }
+/* 挑战长度切换 + 手动添加歌曲 */
+button.chCountBtn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.customAdd { margin: 10px 0; padding: 10px 12px; border: 1px dashed var(--border); border-radius: 10px; }
+.customAddRow { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+.customAddRow input { flex: 1 1 120px; min-width: 0; }
+.customAddRow input[type="number"] { flex: 0 1 90px; }
+#chShareBox img { max-width: 100%; border: 1px solid var(--border); border-radius: 12px; }
+
 @media (max-width: 520px) {
   .row { flex-direction: column; }
   button { width: 100%; }

@@ -20,7 +20,21 @@ const api = require('NeteaseCloudMusicApi');
 const PROXY = process.env.https_proxy || process.env.HTTPS_PROXY || '';
 const BASE = { proxy: PROXY, realIP: true };
 const CURRENT_YEAR = new Date().getFullYear();
-const BATCH = 500;
+const BATCH = 1000;
+
+// 有上限的并发池：按原顺序返回结果
+async function mapPool(items, conc, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i], i);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(conc, items.length) }, worker));
+  return out;
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -253,14 +267,19 @@ async function main() {
   const profile = ud.body.profile;
   console.log(`用户：${profile.nickname}（ID ${uid}，Lv.${ud.body.level}）`);
 
-  // 分页取全部公开歌单
+  // 分页取全部公开歌单（每波并发 3 页，歌单多的用户不用逐页等）
   const playlists = [];
-  for (let offset = 0; ; offset += 100) {
-    const up = await callApi(() => api.user_playlist({ uid, limit: 100, offset, ...BASE }), '歌单列表查询');
-    const list = up.body.playlist || [];
-    playlists.push(...list);
-    if (!up.body.more || !list.length) break;
-    await sleep(200);
+  let waveStart = 0;
+  let pageDone = false;
+  while (!pageDone) {
+    const pages = await Promise.all([waveStart, waveStart + 100, waveStart + 200].map((offset) =>
+      callApi(() => api.user_playlist({ uid, limit: 100, offset, ...BASE }), '歌单列表查询')));
+    for (const up of pages) {
+      const list = up.body.playlist || [];
+      playlists.push(...list);
+      if (!up.body.more || !list.length) { pageDone = true; break; }
+    }
+    waveStart += 300;
   }
   if (!playlists.length) throw new Error('没有找到任何公开歌单。可能对方把歌单都设为了隐私，请在网易云 App 里把歌单设为公开后重试。');
   for (const p of playlists) p.kind = kindOf(p, uid);
@@ -285,14 +304,16 @@ async function main() {
   console.log('计入的歌单：');
   selected.forEach((p) => console.log(`  - ${p.name}（${KIND_LABEL[p.kind]}，${p.trackCount} 首）`));
 
-  // 聚合 trackIds 并跨歌单去重
+  // 聚合 trackIds 并跨歌单去重（4 个歌单并发拉，歌单多的用户不用干等；单个歌单失败跳过并注明）
   const idSet = new Set();
   let rawTotal = 0;
-  for (const p of selected) {
-    const ids = await getFullTrackIds(p);
+  const allIds = await mapPool(selected, 4, async (p) => {
+    try { return await getFullTrackIds(p); }
+    catch (e) { console.log(`  歌单「${p.name}」读取失败，已跳过（${(e.body && e.body.msg) || e.message}）`); return []; }
+  });
+  for (const ids of allIds) {
     rawTotal += ids.length;
     for (const id of ids) idSet.add(id);
-    await sleep(200);
   }
   const trackIds = [...idSet];
   console.log(`原始合计 ${rawTotal} 首，去重后 ${trackIds.length} 首，开始批量查询发行年份…`);

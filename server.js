@@ -116,13 +116,22 @@ async function handleUser(res, uid) {
   try {
     const ud = await callApi(() => api.user_detail({ uid, ...BASE }), '用户信息查询');
     const profile = ud.body.profile;
-    // 分页取全部歌单（喜欢的 + 自建的 + 收藏的），供前端多选
+    // 分页取全部歌单（喜欢的 + 自建的 + 收藏的），供前端多选。
+    // 每波并发取 3 页（歌单 300+ 的用户串行取要 5 秒以上，并发后约 1/3）；
+    // 按 offset 顺序合并，遇到 more=false 或空页就停（最多多发 2 个越界请求，接口返回空列表）。
     const all = [];
-    for (let offset = 0; ; offset += 100) {
-      const up = await callApi(() => api.user_playlist({ uid, limit: 100, offset, ...BASE }), '歌单列表查询');
-      const list = up.body.playlist || [];
-      all.push(...list);
-      if (!up.body.more || !list.length) break;
+    let waveStart = 0;
+    let done = false;
+    while (!done) {
+      const offsets = [waveStart, waveStart + 100, waveStart + 200];
+      const pages = await Promise.all(offsets.map((offset) =>
+        callApi(() => api.user_playlist({ uid, limit: 100, offset, ...BASE }), '歌单列表查询')));
+      for (const up of pages) {
+        const list = up.body.playlist || [];
+        all.push(...list);
+        if (!up.body.more || !list.length) { done = true; break; }
+      }
+      waveStart += 300;
     }
     if (!all.length) {
       return sendJson(res, 404, { error: '没有找到任何公开歌单。可能对方把歌单都设为了隐私——在网易云 App 里把歌单设为公开后即可测试。' });
