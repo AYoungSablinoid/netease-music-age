@@ -1,5 +1,7 @@
 # 音乐年龄测试（中文版 · 网易云）
 
+**在线体验：[netease-music-age.onrender.com](https://netease-music-age.onrender.com/)** — 打开就能测，无需安装，粘贴网易云主页链接即可。
+
 输入一个网易云音乐主页链接，就能根据 TA「喜欢的音乐」歌单里的全部歌曲，算出 TA 的**音乐年龄**。
 
 玩法来自日本站「音楽数珠つなぎ」的 30 MUSIC CHALLENGE：假设每首歌都是在它发行的那一年、你 17 岁时听到的，那么——
@@ -24,9 +26,9 @@
 
 ## 在线体验（网站版）
 
-本项目自带一个完整的网站：打开页面 → 粘贴网易云主页链接 → 自动拉取「喜欢的音乐」歌单并算出音乐年龄，带进度条和结果卡，手机上也能用。
+本项目自带一个完整的网站：打开页面 → 粘贴网易云主页链接 → 自动拉取「喜欢的音乐」歌单并算出音乐年龄，带进度条和结果卡，手机上也能用。正式站点就是顶部的在线体验地址（Render 免费实例闲置后会休眠，下次打开需等几十秒唤醒）。
 
-**一键部署到 Render（免费）：**
+**部署你自己的实例（一键部署到 Render，免费）：**
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/AYoungSablinoid/netease-music-age)
 
