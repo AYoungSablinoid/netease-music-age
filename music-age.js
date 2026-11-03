@@ -281,6 +281,10 @@ async function main() {
   // 统计
   const avg = songs.reduce((a, s) => a + s.age, 0) / songs.length;
   const musicAge = Math.round(avg);
+  // 中位数音乐年龄：平均值容易被极端值拉动（一首 1936 年的歌单曲年龄 107 岁），中位数几乎不受影响，一起看更真实
+  const sortedAges = songs.map((s) => s.age).sort((a, b) => a - b);
+  const mid = Math.floor(sortedAges.length / 2);
+  const medianAge = sortedAges.length % 2 ? sortedAges[mid] : Math.round((sortedAges[mid - 1] + sortedAges[mid]) / 2);
   const sortedByYear = [...songs].sort((a, b) => a.year - b.year);
   const oldest = sortedByYear[0];
   const newest = sortedByYear[sortedByYear.length - 1];
@@ -337,7 +341,7 @@ async function main() {
     playlists: selected.map((p) => ({ id: p.id, name: p.name, kind: p.kind, trackCount: p.trackCount })),
     rawTotal, uniqueTotal: trackIds.length,
     counted: songs.length, noYear,
-    musicAge, avgAge: +avg.toFixed(1), label: generationLabel(musicAge),
+    musicAge, avgAge: +avg.toFixed(1), medianAge, label: generationLabel(musicAge),
     oldest, newest, decades, topArtists,
     records: recordPanels,
     correction: { flagged: flaggedCount, corrected: correction.corrected, ageBeforeCorrection },
@@ -346,6 +350,7 @@ async function main() {
 
   console.log('\n========== 结果 ==========');
   console.log(`${profile.nickname} 的音乐年龄是 ${musicAge} 岁（= ${result.label}）`);
+  console.log(`中位数音乐年龄 ${medianAge} 岁（一半的歌比它老、一半比它新；与平均值差得越多，极端老歌/新歌的影响越大）`);
   console.log(`参与计算 ${songs.length} 首（去重后共 ${trackIds.length} 首，另有 ${noYear} 首缺发行年份未计入）`);
   if (correction.corrected) console.log(`其中 ${correction.corrected} 首重制/再版/精选专辑歌曲已按原版发行年份校正（不校正会算成 ${ageBeforeCorrection} 岁）`);
   console.log(`最老的歌：${oldest.name} — ${oldest.artist}（${oldest.year} 年，单曲音乐年龄 ${oldest.age} 岁）`);
@@ -380,6 +385,7 @@ h1{font-size:20px;margin:0 0 4px}.sub{color:#888;font-size:13px;margin-bottom:16
 .foot{color:#999;font-size:12px;margin-top:16px;line-height:1.6}</style></head><body><div class="card">
 <h1>${profile.nickname} 的音乐年龄</h1><div class="sub">来自${playlistLabel}，去重后 ${trackIds.length} 首，${songs.length} 首参与计算</div>
 <div class="age">${musicAge} 岁</div><div class="label">= ${result.label}</div>
+<div style="text-align:center;color:#888;font-size:13px;margin-bottom:8px">中位数音乐年龄 ${medianAge} 岁（平均 ${result.avgAge} 岁）</div>
 <div class="grid"><div class="box">最老的歌<br><b>${oldest.name}</b><br>${oldest.artist} · ${oldest.year} 年</div>
 <div class="box">最新的歌<br><b>${newest.name}</b><br>${newest.artist} · ${newest.year} 年</div></div>
 <h3 style="margin:12px 0 6px">年代分布</h3>${decadeRows}
