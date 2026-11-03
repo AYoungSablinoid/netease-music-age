@@ -37,12 +37,12 @@ function isTransient(e) {
   if (e && e.body && (e.body.code === 502 || e.body.code === 503 || e.body.code === -462)) return true;
   return false;
 }
-async function callApi(fn, label) {
+async function callApi(fn, label, attempts = 4) {
   let lastErr;
-  for (let attempt = 0; attempt < 4; attempt++) {
+  for (let attempt = 0; attempt < attempts; attempt++) {
     try { return await fn(); } catch (e) {
       lastErr = e;
-      if (!isTransient(e) || attempt === 3) break;
+      if (!isTransient(e) || attempt === attempts - 1) break;
       await sleep(1000 * Math.pow(2, attempt));
     }
   }
@@ -80,6 +80,98 @@ function kindOf(p, uid) {
   return String(creatorId) === String(uid) ? 'own' : 'subscribed';
 }
 const KIND_LABEL = { liked: '我喜欢的音乐', own: '自建', subscribed: '收藏' };
+
+// ---- 重制/再版歌曲的年份校正（与网站后端同一套规则）----
+// 有些歌所在的专辑是重制版、再版或精选集，专辑发行年份晚于歌曲本身的原版年份，
+// 直接用专辑年份会把音乐年龄算小。对这类歌，改用「同歌手 + 同名歌曲的最早版本年份」。
+const FLAG_RE = /remaster|重制|复刻|deluxe|anniversary|reissue|expanded|special edition|纪念版|豪华版|精选|greatest hits|best of|collection|anthology|essential|金曲|\bhits\b|ultimate|definitive/i;
+function isFlagged(name, album) { return FLAG_RE.test(`${name || ''} ${album || ''}`); }
+function cleanTitle(t) {
+  return String(t || '')
+    .replace(/[（(][^）)]*(remaster|remix|live|edit|version|ver\.?|deluxe)[^）)]*[）)]/gi, '')
+    .replace(/[-–—]\s*(remaster|remix).*$/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+const normName = (s) => String(s || '').toLowerCase().replace(/[\s・·.\-_]/g, '');
+
+const originalYearCache = new Map();
+async function findOriginalYear(name, artist) {
+  const base = cleanTitle(name);
+  if (!base || !artist) return null;
+  const key = `${base}|${normName(artist)}`;
+  if (originalYearCache.has(key)) return originalYearCache.get(key);
+  let earliest = null;
+  let failed = false;
+  try {
+    // 校正搜索只重试 3 次：失败只是少校正一首，不值得拖慢整体
+    const r = await callApi(() => api.cloudsearch({ keywords: `${base} ${artist}`, type: 1, limit: 30, ...BASE }), '原版年份搜索', 3);
+    const found = ((r.body.result && r.body.result.songs) || [])
+      .filter((s) => cleanTitle(s.name) === base && (s.ar || []).some((a) => normName(a.name) === normName(artist)));
+    if (found.length) {
+      const sd = await callApi(() => api.song_detail({ ids: found.map((s) => s.id).join(','), ...BASE }), '原版年份详情', 3);
+      for (const s of sd.body.songs || []) {
+        const ts = (s.al && s.al.publishTime) || s.publishTime;
+        if (ts) {
+          const y = new Date(ts).getFullYear();
+          if (y >= 1900 && y <= CURRENT_YEAR && (!earliest || y < earliest)) earliest = y;
+        }
+      }
+    }
+  } catch (e) { earliest = null; failed = true; }
+  if (!failed) originalYearCache.set(key, earliest);
+  return earliest;
+}
+
+// 只校正「最早版本比当前计入年份早 3 年以上」的情况，过滤掉一两年的噪声。原地改 year。
+// 先按「清洗后歌名+主歌手」分组去重（同一首歌在多个歌单重复出现只搜一次），再 5 路并发搜索：
+// 逐首串行时几百首疑似歌曲要几十分钟，并发+去重后快数倍。
+async function correctSongList(list) {
+  // 疑似判定有两种：①歌名/专辑名带重制、再版、精选等关键词；
+  // ②同一批歌里已有同名同歌手的更早版本（早 3 年以上）——这首多半来自精选集或再版，
+  //   即使专辑名不带任何关键词（如精选集《Warheads On Foreheads》）也能抓到。
+  const internalEarliest = new Map();
+  for (const s of list) {
+    if (!s.year) continue;
+    const key = `${cleanTitle(s.name)}|${normName(s.artist.split(' / ')[0])}`;
+    if (!internalEarliest.has(key) || s.year < internalEarliest.get(key)) internalEarliest.set(key, s.year);
+  }
+  const groups = new Map();
+  for (const s of list) {
+    if (!s.year) continue;
+    const key = `${cleanTitle(s.name)}|${normName(s.artist.split(' / ')[0])}`;
+    const suspect = isFlagged(s.name, s.album) || internalEarliest.get(key) <= s.year - 3;
+    if (!suspect) continue;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(s);
+  }
+  const entries = [...groups.values()];
+  let corrected = 0;
+  const examples = [];
+  const CONCURRENCY = 5;
+  for (let i = 0; i < entries.length; i += CONCURRENCY) {
+    const chunk = entries.slice(i, i + CONCURRENCY);
+    await Promise.all(chunk.map(async (songs) => {
+      const rep = songs[0];
+      const earliest = await findOriginalYear(rep.name, rep.artist.split(' / ')[0]);
+      if (!earliest) return;
+      for (const s of songs) {
+        if (earliest <= s.year - 3) {
+          if (examples.length < 5) examples.push(`${s.name}（${s.year} → ${earliest}）`);
+          s.year = earliest;
+          corrected++;
+        }
+      }
+    }));
+    const done = Math.min(i + CONCURRENCY, entries.length);
+    if (done % 50 < CONCURRENCY || done === entries.length) {
+      console.log(`  校正进度 ${done}/${entries.length} 组，已校正 ${corrected} 首`);
+    }
+  }
+  const flagged = entries.reduce((a, g) => a + g.length, 0);
+  return { corrected, examples, flagged };
+}
 
 // 取一个歌单的全量 trackIds（不足时用 track/all 分页补齐）
 async function getFullTrackIds(playlist) {
@@ -174,6 +266,18 @@ async function main() {
   }
   if (!songs.length) throw new Error('没有取到任何带发行年份的歌曲，无法计算。');
 
+  // 校正重制/再版/精选专辑歌曲的年份（专辑年份晚于原版年份会把结果算小）
+  const ageBeforeCorrection = Math.round(songs.reduce((a, s) => a + s.age, 0) / songs.length);
+  console.log('正在检测重制/再版/精选专辑歌曲并查原版年份校正…');
+  const correction = await correctSongList(songs);
+  const flaggedCount = correction.flagged || 0;
+  if (flaggedCount) {
+    for (const s of songs) s.age = CURRENT_YEAR - s.year + 17;
+    console.log(`检测到 ${flaggedCount} 首疑似歌曲，已校正 ${correction.corrected} 首${correction.examples.length ? '，例如：' + correction.examples.join('；') : ''}`);
+  } else {
+    console.log('没有检测到疑似重制/再版/精选专辑歌曲');
+  }
+
   // 统计
   const avg = songs.reduce((a, s) => a + s.age, 0) / songs.length;
   const musicAge = Math.round(avg);
@@ -202,18 +306,21 @@ async function main() {
     const topIds = await fetchChart(0);
     if (weekIds.length || topIds.length) {
       const union = [...new Set([...weekIds, ...topIds])];
-      const yearById = new Map();
+      const metaById = new Map();
       for (let i = 0; i < union.length; i += BATCH) {
         const sd = await callApi(() => api.song_detail({ ids: union.slice(i, i + BATCH).join(','), ...BASE }), '排行歌曲详情查询');
         for (const s of sd.body.songs || []) {
           const ts = (s.al && s.al.publishTime) || s.publishTime;
           const y = ts ? new Date(ts).getFullYear() : null;
-          if (y && y >= 1900 && y <= CURRENT_YEAR) yearById.set(s.id, y);
+          if (y && y >= 1900 && y <= CURRENT_YEAR) {
+            metaById.set(s.id, { name: s.name, artist: (s.ar || []).map((a) => a.name).join(' / '), album: s.al ? s.al.name : '', year: y });
+          }
         }
         await sleep(200);
       }
+      await correctSongList([...metaById.values()]);
       const panel = (ids) => {
-        const ys = ids.map((id) => yearById.get(id)).filter(Boolean);
+        const ys = ids.map((id) => { const m = metaById.get(id); return m ? m.year : null; }).filter(Boolean);
         if (!ys.length) return null;
         return { age: Math.round(ys.reduce((a, y) => a + (CURRENT_YEAR - y + 17), 0) / ys.length), counted: ys.length, total: ids.length };
       };
@@ -233,12 +340,14 @@ async function main() {
     musicAge, avgAge: +avg.toFixed(1), label: generationLabel(musicAge),
     oldest, newest, decades, topArtists,
     records: recordPanels,
+    correction: { flagged: flaggedCount, corrected: correction.corrected, ageBeforeCorrection },
     generatedAt: new Date().toISOString(),
   };
 
   console.log('\n========== 结果 ==========');
   console.log(`${profile.nickname} 的音乐年龄是 ${musicAge} 岁（= ${result.label}）`);
   console.log(`参与计算 ${songs.length} 首（去重后共 ${trackIds.length} 首，另有 ${noYear} 首缺发行年份未计入）`);
+  if (correction.corrected) console.log(`其中 ${correction.corrected} 首重制/再版/精选专辑歌曲已按原版发行年份校正（不校正会算成 ${ageBeforeCorrection} 岁）`);
   console.log(`最老的歌：${oldest.name} — ${oldest.artist}（${oldest.year} 年，单曲音乐年龄 ${oldest.age} 岁）`);
   console.log(`最新的歌：${newest.name} — ${newest.artist}（${newest.year} 年）`);
   console.log('年代分布：', Object.entries(decades).sort((a, b) => a[0] - b[0]).map(([d, c]) => `${d}年代 ${c} 首`).join('、'));
@@ -276,7 +385,7 @@ h1{font-size:20px;margin:0 0 4px}.sub{color:#888;font-size:13px;margin-bottom:16
 <h3 style="margin:12px 0 6px">年代分布</h3>${decadeRows}
 <h3 style="margin:14px 0 6px">歌单里最多的歌手</h3><div style="font-size:14px">${topArtists.map(([a, c]) => `${a}（${c} 首）`).join('、')}</div>
 ${recordPanels ? `<h3 style="margin:14px 0 6px">听歌排行视角</h3><div style="font-size:14px">${[recordPanels.top ? `历史最爱（播放最高 100 首）：<b>${recordPanels.top.age} 岁</b>（${deltaText(recordPanels.top.age)}）` : '', recordPanels.week ? `最近一周在听：<b>${recordPanels.week.age} 岁</b>（${deltaText(recordPanels.week.age)}）` : ''].filter(Boolean).join('<br>')}</div>` : ''}
-<div class="foot">计入歌单：${selected.map((p) => p.name).join('、')}。算法：假设每首歌都是在发行那年 17 岁时听的，单曲音乐年龄 = ${CURRENT_YEAR} − 发行年份 + 17，取全部平均（四舍五入）；同一首歌在多个歌单出现只算一次。另有 ${noYear} 首缺发行年份未计入。作为参照，日本原站「音楽数珠つなぎ」公布的用户平均音乐年龄为 28 岁。数据来自网易云公开接口（NeteaseCloudMusicApi）。</div>
+<div class="foot">计入歌单：${selected.map((p) => p.name).join('、')}。算法：假设每首歌都是在发行那年 17 岁时听的，单曲音乐年龄 = ${CURRENT_YEAR} − 发行年份 + 17，取全部平均（四舍五入）；同一首歌在多个歌单出现只算一次。另有 ${noYear} 首缺发行年份未计入。${correction.corrected ? `其中 ${correction.corrected} 首来自重制/再版/精选专辑，已按原版发行年份校正（不校正会算成 ${ageBeforeCorrection} 岁）。` : ''}作为参照，日本原站「音楽数珠つなぎ」公布的用户平均音乐年龄为 28 岁。数据来自网易云公开接口（NeteaseCloudMusicApi）。</div>
 </div></body></html>`;
   const file = path.join(outDir, `music-age-${uid}.html`);
   fs.writeFileSync(file, html);

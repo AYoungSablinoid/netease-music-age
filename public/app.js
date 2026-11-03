@@ -44,6 +44,51 @@ async function getJson(url, options) {
   return data;
 }
 
+// 重制/再版/精选专辑的歌：专辑年份晚于原版年份，向后端查最早版本年份并校正（原地改 year，返回校正首数）
+// 疑似判定有两种：①歌名/专辑名带重制、再版、精选等关键词；
+// ②同一批歌里已有同名同歌手的更早版本（早 3 年以上）——多半来自精选集/再版，即使专辑名不带关键词也能抓到
+const FLAG_RE = /remaster|重制|复刻|deluxe|anniversary|reissue|expanded|special edition|纪念版|豪华版|精选|greatest hits|best of|collection|anthology|essential|金曲|\bhits\b|ultimate|definitive/i;
+function cleanTitle(t) {
+  return String(t || '')
+    .replace(/[（(][^）)]*(remaster|remix|live|edit|version|ver\.?|deluxe)[^）)]*[）)]/gi, '')
+    .replace(/[-–—]\s*(remaster|remix).*$/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+const normName = (s) => String(s || '').toLowerCase().replace(/[\s・·.\-_]/g, '');
+async function correctSongs(list, onProgress) {
+  const internalEarliest = new Map();
+  for (const s of list) {
+    if (!s.year) continue;
+    const key = `${cleanTitle(s.name)}|${normName(s.artist.split(' / ')[0])}`;
+    if (!internalEarliest.has(key) || s.year < internalEarliest.get(key)) internalEarliest.set(key, s.year);
+  }
+  const flagged = list.filter((s) => {
+    if (!s.year) return false;
+    if (FLAG_RE.test(`${s.name} ${s.album || ''}`)) return true;
+    const key = `${cleanTitle(s.name)}|${normName(s.artist.split(' / ')[0])}`;
+    return internalEarliest.get(key) <= s.year - 3;
+  });
+  let corrected = 0;
+  for (let k = 0; k < flagged.length; k += 25) {
+    const chunk = flagged.slice(k, k + 25);
+    if (onProgress) onProgress(Math.min(k + 25, flagged.length), flagged.length);
+    try {
+      const { results } = await getJson('/api/original-years', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ songs: chunk.map((s) => ({ name: s.name, artist: s.artist.split(' / ')[0], album: s.album, year: s.year })) }),
+      });
+      chunk.forEach((s, j) => {
+        const oy = results[j] && results[j].originalYear;
+        if (oy) { s.year = oy; corrected++; }
+      });
+    } catch (e) { /* 校正失败不阻断主结果，保留专辑年份 */ }
+  }
+  return corrected;
+}
+
 // ---------- 第一步：解析链接，拉取歌单列表 ----------
 form.addEventListener('submit', async (ev) => {
   ev.preventDefault();
@@ -166,15 +211,20 @@ $('calcBtn').addEventListener('click', async () => {
         body: JSON.stringify({ ids: batch }),
       });
       for (const s of part) {
-        if (s.year) songs.push({ ...s, age: CURRENT_YEAR - s.year + 17 });
+        if (s.year) songs.push({ ...s });
         else noYear++;
       }
       const done = Math.min(i + BATCH, ids.length);
-      progress2.show('正在查每首歌的发行年份…', 35 + (done / ids.length) * 60, `已处理 ${done} / ${ids.length} 首（去重后）`);
+      progress2.show('正在查每首歌的发行年份…', 35 + (done / ids.length) * 55, `已处理 ${done} / ${ids.length} 首（去重后）`);
     }
     if (!songs.length) throw new Error('没有取到任何带发行年份的歌曲，无法计算。');
+    // 校正重制/再版歌曲的年份（专辑年份会把结果算小），再统一换算单曲年龄
+    const ageBeforeCorrection = Math.round(songs.reduce((a, s) => a + (CURRENT_YEAR - s.year + 17), 0) / songs.length);
+    const correctedCount = await correctSongs(songs, (doneN, totalN) =>
+      progress2.show('正在校正重制/再版歌曲的发行年份…', 95, `已检查 ${doneN} / ${totalN} 首疑似歌曲`));
+    for (const s of songs) s.age = CURRENT_YEAR - s.year + 17;
     progress2.show('正在计算…', 100);
-    renderResult(currentUser, sel, songs, noYear, rawTotal, ids.length);
+    renderResult(currentUser, sel, songs, noYear, rawTotal, ids.length, { correctedCount, ageBeforeCorrection });
   } catch (e) {
     showError($('errorBox2'), e.message || '出错了，请重试。');
   } finally {
@@ -184,7 +234,7 @@ $('calcBtn').addEventListener('click', async () => {
 });
 
 // ---------- 结果 ----------
-function renderResult(user, selPlaylists, songs, noYear, rawTotal, uniqueTotal) {
+function renderResult(user, selPlaylists, songs, noYear, rawTotal, uniqueTotal, correction) {
   const avg = songs.reduce((a, s) => a + s.age, 0) / songs.length;
   const musicAge = Math.round(avg);
   const sorted = [...songs].sort((a, b) => a.year - b.year);
@@ -227,7 +277,10 @@ function renderResult(user, selPlaylists, songs, noYear, rawTotal, uniqueTotal) 
 
   $('rArtists').textContent = topArtists.map(([a, c]) => `${a}（${c} 首）`).join('、');
   const dupNote = rawTotal > uniqueTotal ? `所选歌单原始合计 ${rawTotal} 首，去重后 ${uniqueTotal} 首；` : '';
-  $('rFoot').textContent = `${dupNote}参与计算 ${songs.length} 首，平均音乐年龄 ${avg.toFixed(1)} 岁（四舍五入为 ${musicAge} 岁）；另有 ${noYear} 首因缺发行年份未计入。单曲音乐年龄 = ${CURRENT_YEAR} − 发行年份 + 17。`;
+  const corrNote = correction && correction.correctedCount
+    ? `其中 ${correction.correctedCount} 首来自重制/再版/精选专辑，已按原版发行年份校正（不校正会算成 ${correction.ageBeforeCorrection} 岁）；`
+    : '';
+  $('rFoot').textContent = `${dupNote}${corrNote}参与计算 ${songs.length} 首，平均音乐年龄 ${avg.toFixed(1)} 岁（四舍五入为 ${musicAge} 岁）；另有 ${noYear} 首因缺发行年份未计入。单曲音乐年龄 = ${CURRENT_YEAR} − 发行年份 + 17。`;
 
   resultCard.classList.remove('hidden');
   resultCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -265,6 +318,7 @@ async function loadRecordPanels(mainAge) {
       });
       for (const s of songs) byId.set(s.id, s);
     }
+    await correctSongs([...byId.values()]);
     const panelAge = (chart) => {
       const ys = chart.map((x) => byId.get(x.id)).filter((s) => s && s.year);
       if (!ys.length) return null;

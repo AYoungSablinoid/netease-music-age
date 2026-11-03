@@ -10,6 +10,7 @@
  *   GET  /api/playlist?id=...   任意歌单的全量 trackIds
  *   GET  /api/record?uid=...    听歌排行：最近一周 + 历史播放最高（对方未公开时 available:false）
  *   POST /api/songs {ids:[..]}  批量取歌曲发行年份（单次 <= 1000 首）
+ *   POST /api/original-years    对重制/再版/精选专辑的歌，查同歌手同名歌曲的最早发行年份
  *
  * 计算（音乐年龄）由前端完成，后端只负责取数，便于部署到任何 Node 托管。
  * 本地运行：node server.js  （端口读 PORT，默认 3000）
@@ -52,16 +53,17 @@ function withTimeout(promise, ms, label) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // 网易云偶尔会临时掐断连接（aborted）或限流，带退避重试能显著提高成功率
-async function callApi(fn, label, timeoutMs = 30000) {
+// attempts 可调：校正用的搜索失败只是少校正一首，不值得像主流程那样反复重试拖慢整体
+async function callApi(fn, label, timeoutMs = 30000, attempts = 3) {
   let lastErr;
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
       return await withTimeout(fn(), timeoutMs, label);
     } catch (e) {
       lastErr = e;
       const code = e && e.body && e.body.code;
       if (code === -462) break; // 触发验证时重试无意义
-      if (attempt < 3) await sleep(attempt * 1500);
+      if (attempt < attempts) await sleep(attempt * 1200);
     }
   }
   throw lastErr;
@@ -219,6 +221,7 @@ async function handleSongs(req, res) {
               id: s.id,
               name: s.name,
               artist: (s.ar || []).map((a) => a.name).join(' / '),
+              album: (s.al && s.al.name) || '',
               year: year && year >= 1900 && year <= CURRENT_YEAR ? year : null,
             };
           } else {
@@ -230,6 +233,90 @@ async function handleSongs(req, res) {
         }
       }
       sendJson(res, 200, { songs: out });
+    } catch (e) {
+      const m = mapApiError(e);
+      sendJson(res, m.status, { error: m.error });
+    }
+  });
+}
+
+// ---- 重制/再版歌曲的年份校正 ----
+// 有些歌所在的专辑是重制版、再版或精选集，专辑发行年份晚于歌曲本身的原版年份，
+// 直接用专辑年份会把音乐年龄算小。对这类歌，改用「同歌手 + 同名歌曲的最早版本年份」。
+const FLAG_RE = /remaster|重制|复刻|deluxe|anniversary|reissue|expanded|special edition|纪念版|豪华版|精选|greatest hits|best of|collection|anthology|essential|金曲|\bhits\b|ultimate|definitive/i;
+function isFlagged(name, album) { return FLAG_RE.test(`${name || ''} ${album || ''}`); }
+
+function cleanTitle(t) {
+  return String(t || '')
+    .replace(/[（(][^）)]*(remaster|remix|live|edit|version|ver\.?|deluxe)[^）)]*[）)]/gi, '')
+    .replace(/[-–—]\s*(remaster|remix).*$/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+const normName = (s) => String(s || '').toLowerCase().replace(/[\s・·.\-_]/g, '');
+
+const originalYearCache = new Map();
+async function findOriginalYear(name, artist) {
+  const base = cleanTitle(name);
+  if (!base || !artist) return null;
+  const key = `${base}|${normName(artist)}`;
+  if (originalYearCache.has(key)) return originalYearCache.get(key);
+  let earliest = null;
+  let failed = false;
+  try {
+    const r = await callApi(() => api.cloudsearch({ keywords: `${base} ${artist}`, type: 1, limit: 30, ...BASE }), '原版年份搜索', 20000, 3);
+    const found = ((r.body.result && r.body.result.songs) || [])
+      .filter((s) => cleanTitle(s.name) === base && (s.ar || []).some((a) => normName(a.name) === normName(artist)));
+    if (found.length) {
+      const sd = await callApi(() => api.song_detail({ ids: found.map((s) => s.id).join(','), ...BASE }), '原版年份详情', 20000, 3);
+      for (const s of sd.body.songs || []) {
+        const ts = (s.al && s.al.publishTime) || s.publishTime;
+        if (ts) {
+          const y = new Date(ts).getFullYear();
+          if (y >= 1900 && y <= CURRENT_YEAR && (!earliest || y < earliest)) earliest = y;
+        }
+      }
+    }
+  } catch (e) { earliest = null; failed = true; }
+  // 搜索失败（网络抖动）不写缓存，否则一次失败会把这首歌在进程生命周期内永久误判为无原版
+  if (!failed) {
+    if (originalYearCache.size > 20000) originalYearCache.clear();
+    originalYearCache.set(key, earliest);
+  }
+  return earliest;
+}
+
+// 只校正「最早版本比当前计入年份早 3 年以上」的情况，过滤掉一两年的噪声
+async function handleOriginalYears(req, res) {
+  let raw = '';
+  req.on('data', (c) => { raw += c; if (raw.length > 1e6) req.destroy(); });
+  req.on('end', async () => {
+    try {
+      const { songs } = JSON.parse(raw || '{}');
+      if (!Array.isArray(songs) || !songs.length || songs.length > 50 || !songs.every((s) => s && typeof s.name === 'string')) {
+        return sendJson(res, 400, { error: '参数不合法：songs 应为 1~50 首' });
+      }
+      // 5 路并发查原版年份：逐首串行时几百首疑似歌曲要查几十分钟，并发后快数倍；
+      // findOriginalYear 内部有缓存，同一首歌在不同歌单/排行里重复出现只查一次
+      const results = new Array(songs.length);
+      let nextIdx = 0;
+      const worker = async () => {
+        while (nextIdx < songs.length) {
+          const i = nextIdx++;
+          const s = songs[i];
+          let originalYear = null;
+          // 疑似判定由调用方负责（关键词标记，或同一歌单里已有更早的同名同歌手版本）；
+          // 这里对送来的每首直接查最早版本，不再重复关键词过滤，避免漏掉专辑名不带关键词的精选集
+          if (s.year) {
+            const earliest = await findOriginalYear(s.name, s.artist);
+            if (earliest && earliest <= s.year - 3) originalYear = earliest;
+          }
+          results[i] = { originalYear };
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(5, songs.length) }, worker));
+      sendJson(res, 200, { results });
     } catch (e) {
       const m = mapApiError(e);
       sendJson(res, m.status, { error: m.error });
@@ -257,6 +344,7 @@ const server = http.createServer(async (req, res) => {
   if (pathname === '/api/playlist' && req.method === 'GET') return handlePlaylist(res, url.searchParams.get('id'));
   if (pathname === '/api/record' && req.method === 'GET') return handleRecord(res, url.searchParams.get('uid'));
   if (pathname === '/api/songs' && req.method === 'POST') return handleSongs(req, res);
+  if (pathname === '/api/original-years' && req.method === 'POST') return handleOriginalYears(req, res);
   if (pathname.startsWith('/api/')) return sendJson(res, 404, { error: '接口不存在' });
 
   // 静态文件
