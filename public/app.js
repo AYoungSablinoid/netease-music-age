@@ -696,7 +696,7 @@ function showChallengeResult(picked, breakdownItems) {
   bd.innerHTML = '';
   if (breakdownItems && breakdownItems.length) {
     const h = document.createElement('h3');
-    h.textContent = '我的 30 个命题答案';
+    h.textContent = `我的 ${breakdownItems.length} 个命题答案`;
     bd.appendChild(h);
     for (const it of breakdownItems) {
       const row = document.createElement('div');
