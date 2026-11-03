@@ -1,0 +1,1 @@
+{"dependencies":{"NeteaseCloudMusicApi":"^4.32.0"},"description":"中文版音乐年龄测试：输入网易云音乐主页链接，按「喜欢的音乐」歌单全量歌曲的发行年份计算音乐年龄","engines":{"node":">=18"},"keywords":["netease","music-age","网易云音乐","音乐年龄"],"license":"MIT","main":"music-age.js","name":"netease-music-age","scripts":{"start":"node music-age.js"},"version":"1.0.0"}
