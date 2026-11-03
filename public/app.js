@@ -10,6 +10,7 @@ const selectCard = $('selectCard');
 const resultCard = $('resultCard');
 
 let currentUser = null; // /api/user 的返回：{nickname, avatarUrl, level, playlists[]}
+let currentUid = null;
 
 function generationLabel(age) {
   if (age <= 22) return 'Z 世代的耳朵';
@@ -56,6 +57,7 @@ form.addEventListener('submit', async (ev) => {
   try {
     progress1.show('正在解析链接…', 15);
     const { uid } = await getJson('/api/resolve?url=' + encodeURIComponent(link));
+    currentUid = uid;
     progress1.show('正在读取歌单列表…', 60);
     currentUser = await getJson('/api/user?uid=' + encodeURIComponent(uid));
     progress1.show('读取完成', 100);
@@ -72,7 +74,10 @@ form.addEventListener('submit', async (ev) => {
 // ---------- 第二步：选择歌单 ----------
 function renderSelect(user) {
   $('selNickname').textContent = user.nickname;
-  $('selMeta').textContent = `共 ${user.playlists.length} 个公开歌单`;
+  const subN = user.playlists.filter((p) => p.kind === 'subscribed').length;
+  $('selMeta').textContent = subN
+    ? `共 ${user.playlists.length} 个公开歌单，其中 ${subN} 个是收藏的别人歌单`
+    : `共 ${user.playlists.length} 个公开歌单`;
   const av = $('selAvatar');
   if (user.avatarUrl) {
     av.src = user.avatarUrl;
@@ -89,9 +94,11 @@ function renderSelect(user) {
     label.innerHTML =
       `<input type="checkbox" class="plCheck" data-id="${p.id}" ${checked ? 'checked' : ''}>` +
       (p.coverImgUrl ? `<img class="plCover" src="${p.coverImgUrl}" alt="" loading="lazy">` : '') +
-      `<span class="plMain"><span class="plName"></span><span class="plSub">${p.trackCount} 首</span></span>` +
+      `<span class="plMain"><span class="plName"></span><span class="plSub"></span></span>` +
       `<span class="tag tag-${p.kind}">${KIND_LABEL[p.kind] || ''}</span>`;
     label.querySelector('.plName').textContent = p.name;
+    label.querySelector('.plSub').textContent =
+      (p.kind === 'subscribed' && p.creatorName ? `创建者 ${p.creatorName} · ` : '') + `${p.trackCount} 首`;
     list.appendChild(label);
   }
   list.querySelectorAll('.plCheck').forEach((cb) => cb.addEventListener('change', updateSummary));
@@ -224,6 +231,67 @@ function renderResult(user, selPlaylists, songs, noYear, rawTotal, uniqueTotal) 
 
   resultCard.classList.remove('hidden');
   resultCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  loadRecordPanels(musicAge);
+}
+
+// ---------- 听歌排行视角：历史最爱 Top100 + 最近一周 ----------
+function deltaText(panelAge, mainAge) {
+  const d = panelAge - mainAge;
+  if (d <= -2) return `比歌单年龄年轻 ${-d} 岁`;
+  if (d >= 2) return `比歌单年龄老 ${d} 岁`;
+  return '和歌单年龄差不多';
+}
+
+async function loadRecordPanels(mainAge) {
+  const box = $('recordBox');
+  box.innerHTML = '<p class="recordNote">正在读取听歌排行…</p>';
+  try {
+    const rec = await getJson('/api/record?uid=' + encodeURIComponent(currentUid));
+    if (!rec.available) {
+      box.innerHTML = '';
+      const p = document.createElement('p');
+      p.className = 'recordNote';
+      p.textContent = rec.reason ? `这两项暂时算不了：${rec.reason}。` : '对方未公开听歌排行，这两项算不了。';
+      box.appendChild(p);
+      return;
+    }
+    const ids = [...new Set([...rec.week, ...rec.top].map((x) => x.id))];
+    const byId = new Map();
+    for (let i = 0; i < ids.length; i += BATCH) {
+      const { songs } = await getJson('/api/songs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: ids.slice(i, i + BATCH) }),
+      });
+      for (const s of songs) byId.set(s.id, s);
+    }
+    const panelAge = (chart) => {
+      const ys = chart.map((x) => byId.get(x.id)).filter((s) => s && s.year);
+      if (!ys.length) return null;
+      return {
+        age: Math.round(ys.reduce((a, s) => a + (CURRENT_YEAR - s.year + 17), 0) / ys.length),
+        counted: ys.length,
+        total: chart.length,
+      };
+    };
+    const week = panelAge(rec.week);
+    const top = panelAge(rec.top);
+    const panelHtml = (title, panel) => panel
+      ? `<div class="box"><div class="boxTitle">${title}</div><div class="boxMain">${panel.age} 岁</div><div class="boxSub">按 ${panel.counted} 首计 · ${deltaText(panel.age, mainAge)}</div></div>`
+      : `<div class="box"><div class="boxTitle">${title}</div><div class="boxMain">—</div><div class="boxSub">没有可计算的数据</div></div>`;
+    let verdict = '';
+    if (week) {
+      if (week.age <= mainAge - 2) verdict = '结论：最近一周实际在听的歌，明显比歌单收藏更年轻——TA 的口味正在往新歌走，音乐年龄在变年轻。';
+      else if (week.age >= mainAge + 2) verdict = '结论：最近一周实际在听的歌，明显比歌单收藏更老——TA 最近在回头听老歌，音乐年龄在变老。';
+      else verdict = '结论：最近一周实际在听的歌和歌单品味基本一致，音乐年龄很稳定。';
+    }
+    box.innerHTML =
+      `<div class="grid">${panelHtml('历史最爱 · 播放最高 100 首', top)}${panelHtml('最近一周在听', week)}</div>` +
+      (verdict ? `<p class="verdict"></p>` : '');
+    if (verdict) box.querySelector('.verdict').textContent = verdict;
+  } catch (e) {
+    box.innerHTML = '<p class="recordNote">听歌排行读取失败，这两项暂时算不了。</p>';
+  }
 }
 
 $('adjustBtn').addEventListener('click', () => {
@@ -236,6 +304,7 @@ $('againBtn').addEventListener('click', () => {
   resultCard.classList.add('hidden');
   selectCard.classList.add('hidden');
   currentUser = null;
+  currentUid = null;
   input.value = '';
   input.focus();
   window.scrollTo({ top: 0, behavior: 'smooth' });

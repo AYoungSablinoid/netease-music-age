@@ -6,8 +6,9 @@
  * 接口：
  *   GET  /api/health            健康检查
  *   GET  /api/resolve?url=...   主页链接/短链接 -> 用户 ID
- *   GET  /api/user?uid=...      用户资料 + 全部歌单列表（喜欢/自建/收藏分类）
+ *   GET  /api/user?uid=...      用户资料 + 全部歌单列表（按创建者区分喜欢/自建/收藏）
  *   GET  /api/playlist?id=...   任意歌单的全量 trackIds
+ *   GET  /api/record?uid=...    听歌排行：最近一周 + 历史播放最高（对方未公开时 available:false）
  *   POST /api/songs {ids:[..]}  批量取歌曲发行年份（单次 <= 1000 首）
  *
  * 计算（音乐年龄）由前端完成，后端只负责取数，便于部署到任何 Node 托管。
@@ -124,13 +125,19 @@ async function handleUser(res, uid) {
     if (!all.length) {
       return sendJson(res, 404, { error: '没有找到任何公开歌单。可能对方把歌单都设为了隐私——在网易云 App 里把歌单设为公开后即可测试。' });
     }
-    const playlists = all.map((p) => ({
-      id: p.id,
-      name: p.name,
-      trackCount: p.trackCount,
-      coverImgUrl: p.coverImgUrl || '',
-      kind: p.specialType === 5 ? 'liked' : p.subscribed ? 'subscribed' : 'own',
-    }));
+    // 分类不能看 subscribed 字段：匿名请求时它恒为 null。
+    // 可靠依据是创建者：creator.userId 等于本人 => 自建，否则就是收藏的别人歌单。
+    const playlists = all.map((p) => {
+      const creatorId = p.creator && p.creator.userId;
+      return {
+        id: p.id,
+        name: p.name,
+        trackCount: p.trackCount,
+        coverImgUrl: p.coverImgUrl || '',
+        creatorName: (p.creator && p.creator.nickname) || '',
+        kind: p.specialType === 5 ? 'liked' : String(creatorId) === String(uid) ? 'own' : 'subscribed',
+      };
+    });
     sendJson(res, 200, {
       nickname: profile.nickname,
       avatarUrl: profile.avatarUrl || '',
@@ -138,6 +145,32 @@ async function handleUser(res, uid) {
       playlists,
     });
   } catch (e) {
+    const m = mapApiError(e);
+    sendJson(res, m.status, { error: m.error });
+  }
+}
+
+// 听歌排行：type=1 最近一周，type=0 历史累计（接口本身按播放量从高到低返回，最多 100 条）
+// 这是网易云的公开数据（用户可在 App 里设置可见性）；未公开时接口返回 -2，这里转成 available:false，不算错误
+async function handleRecord(res, uid) {
+  if (!/^\d+$/.test(uid || '')) return sendJson(res, 400, { error: '用户 ID 不合法' });
+  const fetchChart = async (type) => {
+    const r = await callApi(() => api.user_record({ uid, type, ...BASE }), '听歌排行查询');
+    const list = (type === 1 ? r.body.weekData : r.body.allData) || [];
+    return list.map((it) => ({ id: it.song.id, playCount: it.playCount || 0 }));
+  };
+  try {
+    const week = await fetchChart(1);
+    const top = await fetchChart(0);
+    if (!week.length && !top.length) {
+      return sendJson(res, 200, { available: false, reason: '对方的听歌排行是空的' });
+    }
+    sendJson(res, 200, { available: true, week, top });
+  } catch (e) {
+    const code = e && e.body && e.body.code;
+    if (code === -2 || code === 301 || code === -301) {
+      return sendJson(res, 200, { available: false, reason: '对方未公开听歌排行（可在网易云 App 设置里公开）' });
+    }
     const m = mapApiError(e);
     sendJson(res, m.status, { error: m.error });
   }
@@ -222,6 +255,7 @@ const server = http.createServer(async (req, res) => {
   }
   if (pathname === '/api/user' && req.method === 'GET') return handleUser(res, url.searchParams.get('uid'));
   if (pathname === '/api/playlist' && req.method === 'GET') return handlePlaylist(res, url.searchParams.get('id'));
+  if (pathname === '/api/record' && req.method === 'GET') return handleRecord(res, url.searchParams.get('uid'));
   if (pathname === '/api/songs' && req.method === 'POST') return handleSongs(req, res);
   if (pathname.startsWith('/api/')) return sendJson(res, 404, { error: '接口不存在' });
 

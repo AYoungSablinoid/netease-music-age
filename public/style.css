@@ -135,6 +135,8 @@ button.mini:hover { border-color: var(--accent); color: var(--accent); backgroun
 }
 .tag-liked { color: var(--accent); border-color: var(--accent); }
 .selSummary { color: var(--muted); font-size: 13px; margin: 12px 0 10px; }
+.recordNote { color: var(--muted); font-size: 13.5px; margin: 6px 0; }
+.verdict { font-size: 14.5px; margin: 10px 0 2px; }
 #calcBtn { width: 100%; }
 .resultBtns { display: flex; gap: 10px; }
 .resultBtns .secondary { flex: 1; width: auto; }

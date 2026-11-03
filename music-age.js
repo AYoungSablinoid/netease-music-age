@@ -72,8 +72,12 @@ function generationLabel(age) {
   return '黄金年代的耳朵';
 }
 
-function kindOf(p) {
-  return p.specialType === 5 ? 'liked' : p.subscribed ? 'subscribed' : 'own';
+// 分类不能看 subscribed 字段：匿名请求时它恒为 null。
+// 可靠依据是创建者：creator.userId 等于本人 => 自建，否则就是收藏的别人歌单。
+function kindOf(p, uid) {
+  if (p.specialType === 5) return 'liked';
+  const creatorId = p.creator && p.creator.userId;
+  return String(creatorId) === String(uid) ? 'own' : 'subscribed';
 }
 const KIND_LABEL = { liked: '我喜欢的音乐', own: '自建', subscribed: '收藏' };
 
@@ -117,11 +121,11 @@ async function main() {
     await sleep(200);
   }
   if (!playlists.length) throw new Error('没有找到任何公开歌单。可能对方把歌单都设为了隐私，请在网易云 App 里把歌单设为公开后重试。');
-  for (const p of playlists) p.kind = kindOf(p);
+  for (const p of playlists) p.kind = kindOf(p, uid);
 
   if (optList) {
     console.log(`\n全部公开歌单（共 ${playlists.length} 个）：`);
-    playlists.forEach((p, i) => console.log(`  [${i}] ${p.name}｜${KIND_LABEL[p.kind]}｜${p.trackCount} 首｜ID ${p.id}`));
+    playlists.forEach((p, i) => console.log(`  [${i}] ${p.name}｜${KIND_LABEL[p.kind]}${p.kind === 'subscribed' && p.creator ? `（创建者：${p.creator.nickname}）` : ''}｜${p.trackCount} 首｜ID ${p.id}`));
     console.log('\n用 --ids=<歌单ID1,歌单ID2> 选择要计算的歌单，或 --all 计算喜欢+全部自建歌单。');
     return;
   }
@@ -186,6 +190,41 @@ async function main() {
   const topArtists = Object.entries(artistCount).sort((a, b) => b[1] - a[1]).slice(0, 5);
   const playlistLabel = selected.length === 1 ? selected[0].name : `${selected.length} 个歌单`;
 
+  // 听歌排行视角：历史播放最高 100 首 + 最近一周（对方未公开排行时跳过，不影响主结果）
+  let recordPanels = null;
+  try {
+    const fetchChart = async (type) => {
+      const r = await callApi(() => api.user_record({ uid, type, ...BASE }), '听歌排行查询');
+      const list = (type === 1 ? r.body.weekData : r.body.allData) || [];
+      return list.map((it) => it.song.id);
+    };
+    const weekIds = await fetchChart(1);
+    const topIds = await fetchChart(0);
+    if (weekIds.length || topIds.length) {
+      const union = [...new Set([...weekIds, ...topIds])];
+      const yearById = new Map();
+      for (let i = 0; i < union.length; i += BATCH) {
+        const sd = await callApi(() => api.song_detail({ ids: union.slice(i, i + BATCH).join(','), ...BASE }), '排行歌曲详情查询');
+        for (const s of sd.body.songs || []) {
+          const ts = (s.al && s.al.publishTime) || s.publishTime;
+          const y = ts ? new Date(ts).getFullYear() : null;
+          if (y && y >= 1900 && y <= CURRENT_YEAR) yearById.set(s.id, y);
+        }
+        await sleep(200);
+      }
+      const panel = (ids) => {
+        const ys = ids.map((id) => yearById.get(id)).filter(Boolean);
+        if (!ys.length) return null;
+        return { age: Math.round(ys.reduce((a, y) => a + (CURRENT_YEAR - y + 17), 0) / ys.length), counted: ys.length, total: ids.length };
+      };
+      recordPanels = { week: panel(weekIds), top: panel(topIds) };
+    }
+  } catch (e) { recordPanels = null; }
+  const deltaText = (panelAge) => {
+    const d = panelAge - musicAge;
+    return d <= -2 ? `比歌单年龄年轻 ${-d} 岁` : d >= 2 ? `比歌单年龄老 ${d} 岁` : '和歌单年龄差不多';
+  };
+
   const result = {
     nickname: profile.nickname, uid,
     playlists: selected.map((p) => ({ id: p.id, name: p.name, kind: p.kind, trackCount: p.trackCount })),
@@ -193,6 +232,7 @@ async function main() {
     counted: songs.length, noYear,
     musicAge, avgAge: +avg.toFixed(1), label: generationLabel(musicAge),
     oldest, newest, decades, topArtists,
+    records: recordPanels,
     generatedAt: new Date().toISOString(),
   };
 
@@ -203,6 +243,17 @@ async function main() {
   console.log(`最新的歌：${newest.name} — ${newest.artist}（${newest.year} 年）`);
   console.log('年代分布：', Object.entries(decades).sort((a, b) => a[0] - b[0]).map(([d, c]) => `${d}年代 ${c} 首`).join('、'));
   console.log('最爱年代歌手 Top5：', topArtists.map(([a, c]) => `${a}（${c} 首）`).join('、'));
+  if (recordPanels) {
+    console.log('\n----- 听歌排行视角 -----');
+    if (recordPanels.top) console.log(`历史最爱（播放最高 100 首）：${recordPanels.top.age} 岁（按 ${recordPanels.top.counted} 首计，${deltaText(recordPanels.top.age)}）`);
+    if (recordPanels.week) {
+      console.log(`最近一周在听：${recordPanels.week.age} 岁（按 ${recordPanels.week.counted} 首计，${deltaText(recordPanels.week.age)}）`);
+      const d = recordPanels.week.age - musicAge;
+      console.log(d <= -2 ? '结论：最近实际在听的歌比歌单更年轻，音乐年龄在变年轻。' : d >= 2 ? '结论：最近实际在听的歌比歌单更老，音乐年龄在变老。' : '结论：最近实际在听的歌和歌单品味基本一致，音乐年龄稳定。');
+    }
+  } else {
+    console.log('\n（听歌排行未公开或为空，排行视角跳过）');
+  }
 
   // HTML 结果卡
   const outDir = path.join(__dirname, 'output');
@@ -224,6 +275,7 @@ h1{font-size:20px;margin:0 0 4px}.sub{color:#888;font-size:13px;margin-bottom:16
 <div class="box">最新的歌<br><b>${newest.name}</b><br>${newest.artist} · ${newest.year} 年</div></div>
 <h3 style="margin:12px 0 6px">年代分布</h3>${decadeRows}
 <h3 style="margin:14px 0 6px">歌单里最多的歌手</h3><div style="font-size:14px">${topArtists.map(([a, c]) => `${a}（${c} 首）`).join('、')}</div>
+${recordPanels ? `<h3 style="margin:14px 0 6px">听歌排行视角</h3><div style="font-size:14px">${[recordPanels.top ? `历史最爱（播放最高 100 首）：<b>${recordPanels.top.age} 岁</b>（${deltaText(recordPanels.top.age)}）` : '', recordPanels.week ? `最近一周在听：<b>${recordPanels.week.age} 岁</b>（${deltaText(recordPanels.week.age)}）` : ''].filter(Boolean).join('<br>')}</div>` : ''}
 <div class="foot">计入歌单：${selected.map((p) => p.name).join('、')}。算法：假设每首歌都是在发行那年 17 岁时听的，单曲音乐年龄 = ${CURRENT_YEAR} − 发行年份 + 17，取全部平均（四舍五入）；同一首歌在多个歌单出现只算一次。另有 ${noYear} 首缺发行年份未计入。作为参照，日本原站「音楽数珠つなぎ」公布的用户平均音乐年龄为 28 岁。数据来自网易云公开接口（NeteaseCloudMusicApi）。</div>
 </div></body></html>`;
   const file = path.join(outDir, `music-age-${uid}.html`);
