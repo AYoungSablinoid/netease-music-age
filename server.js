@@ -224,6 +224,11 @@ async function handleSongs(req, res) {
               album: (s.al && s.al.name) || '',
               year: year && year >= 1900 && year <= CURRENT_YEAR ? year : null,
             };
+            // 顺手记下专辑年份：校正时搜到的候选若在这张专辑里，直接命中、不用再发详情请求
+            if (s.al && s.al.id && item.year) {
+              if (albumYearCache.size > 60000) albumYearCache.clear();
+              albumYearCache.set(s.al.id, item.year);
+            }
           } else {
             item = { id: Number(id), name: '', artist: '', year: null };
           }
@@ -256,35 +261,112 @@ function cleanTitle(t) {
 }
 const normName = (s) => String(s || '').toLowerCase().replace(/[\s・·.\-_]/g, '');
 
-const originalYearCache = new Map();
-async function findOriginalYear(name, artist) {
+const originalYearCache = new Map(); // 「清洗歌名|歌手」-> 最早版本年份（null 表示确认没有更早版本）
+const albumYearCache = new Map(); // 专辑 ID -> 发行年份（由 /api/songs 的详情顺手填充，校正时命中就不用再查）
+
+// 全局搜索信号量：不管同时进来几个校正请求，cloudsearch 并发都压在 8 以内。
+// 实测（80 组基准）：并发 8 时一轮搜索约 27 秒，并发 5 约 47 秒、并发 3 约 78 秒；
+// 再高容易触发网易云/代理的 aborted 限流， retries 会把收益吃掉。
+let searchInFlight = 0;
+const searchWaiters = [];
+async function withSearchSlot(fn) {
+  if (searchInFlight >= 8) await new Promise((r) => searchWaiters.push(r));
+  searchInFlight++;
+  try { return await fn(); } finally {
+    searchInFlight--;
+    const w = searchWaiters.shift();
+    if (w) w();
+  }
+}
+
+async function searchCandidates(name, artist) {
   const base = cleanTitle(name);
-  if (!base || !artist) return null;
-  const key = `${base}|${normName(artist)}`;
-  if (originalYearCache.has(key)) return originalYearCache.get(key);
-  let earliest = null;
-  let failed = false;
-  try {
-    const r = await callApi(() => api.cloudsearch({ keywords: `${base} ${artist}`, type: 1, limit: 30, ...BASE }), '原版年份搜索', 20000, 3);
-    const found = ((r.body.result && r.body.result.songs) || [])
-      .filter((s) => cleanTitle(s.name) === base && (s.ar || []).some((a) => normName(a.name) === normName(artist)));
-    if (found.length) {
-      const sd = await callApi(() => api.song_detail({ ids: found.map((s) => s.id).join(','), ...BASE }), '原版年份详情', 20000, 3);
+  const r = await withSearchSlot(() => callApi(
+    () => api.cloudsearch({ keywords: `${base} ${artist}`, type: 1, limit: 30, ...BASE }),
+    '原版年份搜索', 20000, 3,
+  ));
+  return ((r.body.result && r.body.result.songs) || [])
+    .filter((s) => cleanTitle(s.name) === base && (s.ar || []).some((a) => normName(a.name) === normName(artist)))
+    .map((s) => ({ id: s.id, albumId: s.al ? s.al.id : 0 }));
+}
+
+// 批量解析一组疑似歌曲的最早版本年份。旧做法是逐首「搜索+详情」两次往返，
+// 几百首就是上千次小请求；新做法分三段：
+//   1) 按「清洗歌名+歌手」分组（同歌多版本只搜一次），并发搜索拿候选（只拿 ID 和专辑 ID）；
+//   2) 候选按专辑去重（同专辑年份相同，只留一个代表），不在 albumYearCache 里的专辑
+//      合并成 500 个一批的 song/detail 大请求——80 组实测详情请求从 88 次降到 1 次；
+//   3) 每组在候选专辑年份里取最小值。年份一律以详情接口返回的专辑 ID 为准入缓存，避免两端专辑 ID 不一致时张冠李戴。
+// 返回与入参等长的数组，每项为最早年份或 null；搜索失败的组返回 null 且不写缓存。
+async function resolveOriginalYears(items) {
+  const groups = new Map();
+  items.forEach((s, i) => {
+    const key = `${cleanTitle(s.name)}|${normName(s.artist)}`;
+    if (!groups.has(key)) groups.set(key, { name: s.name, artist: s.artist, idxs: [] });
+    groups.get(key).idxs.push(i);
+  });
+  const groupList = [...groups.entries()];
+  const earliestByKey = new Map();
+  const needSearch = [];
+  for (const [key, g] of groupList) {
+    if (originalYearCache.has(key)) earliestByKey.set(key, originalYearCache.get(key));
+    else needSearch.push([key, g]);
+  }
+  // 1) 并发搜索
+  const candByKey = new Map();
+  const failedKeys = new Set();
+  let nextIdx = 0;
+  const worker = async () => {
+    while (nextIdx < needSearch.length) {
+      const [key, g] = needSearch[nextIdx++];
+      try { candByKey.set(key, await searchCandidates(g.name, g.artist)); }
+      catch (e) { candByKey.set(key, []); failedKeys.add(key); }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(8, needSearch.length) }, worker));
+  // 2) 专辑去重 + 批量详情
+  const repByAlbum = new Map();
+  for (const cands of candByKey.values()) {
+    for (const c of cands) if (c.albumId && !repByAlbum.has(c.albumId)) repByAlbum.set(c.albumId, c.id);
+  }
+  const needAlbums = [...repByAlbum.entries()].filter(([aid]) => !albumYearCache.has(aid));
+  const songYearById = new Map();
+  for (let i = 0; i < needAlbums.length; i += 500) {
+    const batch = needAlbums.slice(i, i + 500);
+    try {
+      const sd = await callApi(
+        () => api.song_detail({ ids: batch.map(([, id]) => id).join(','), ...BASE }),
+        '原版年份详情', 30000, 3,
+      );
       for (const s of sd.body.songs || []) {
         const ts = (s.al && s.al.publishTime) || s.publishTime;
-        if (ts) {
-          const y = new Date(ts).getFullYear();
-          if (y >= 1900 && y <= CURRENT_YEAR && (!earliest || y < earliest)) earliest = y;
-        }
+        if (!ts) continue;
+        const y = new Date(ts).getFullYear();
+        if (y < 1900 || y > CURRENT_YEAR) continue;
+        songYearById.set(s.id, y);
+        if (s.al && s.al.id) albumYearCache.set(s.al.id, y);
       }
-    }
-  } catch (e) { earliest = null; failed = true; }
-  // 搜索失败（网络抖动）不写缓存，否则一次失败会把这首歌在进程生命周期内永久误判为无原版
-  if (!failed) {
-    if (originalYearCache.size > 20000) originalYearCache.clear();
-    originalYearCache.set(key, earliest);
+    } catch (e) { /* 这一批详情失败，对应组按查不到处理，不写缓存 */ }
   }
-  return earliest;
+  if (albumYearCache.size > 60000) albumYearCache.clear();
+  // 3) 汇总每组最早年份
+  for (const [key, cands] of candByKey) {
+    let earliest = null;
+    for (const c of cands) {
+      const y = songYearById.get(c.id) ?? (c.albumId ? albumYearCache.get(c.albumId) : null);
+      if (y && (!earliest || y < earliest)) earliest = y;
+    }
+    earliestByKey.set(key, earliest);
+    if (!failedKeys.has(key)) {
+      if (originalYearCache.size > 20000) originalYearCache.clear();
+      originalYearCache.set(key, earliest);
+    }
+  }
+  const out = new Array(items.length).fill(null);
+  for (const [key, g] of groupList) {
+    const earliest = earliestByKey.get(key);
+    for (const i of g.idxs) out[i] = earliest ?? null;
+  }
+  return out;
 }
 
 // 只校正「最早版本比当前计入年份早 3 年以上」的情况，过滤掉一两年的噪声
@@ -297,25 +379,14 @@ async function handleOriginalYears(req, res) {
       if (!Array.isArray(songs) || !songs.length || songs.length > 50 || !songs.every((s) => s && typeof s.name === 'string')) {
         return sendJson(res, 400, { error: '参数不合法：songs 应为 1~50 首' });
       }
-      // 5 路并发查原版年份：逐首串行时几百首疑似歌曲要查几十分钟，并发后快数倍；
-      // findOriginalYear 内部有缓存，同一首歌在不同歌单/排行里重复出现只查一次
-      const results = new Array(songs.length);
-      let nextIdx = 0;
-      const worker = async () => {
-        while (nextIdx < songs.length) {
-          const i = nextIdx++;
-          const s = songs[i];
-          let originalYear = null;
-          // 疑似判定由调用方负责（关键词标记，或同一歌单里已有更早的同名同歌手版本）；
-          // 这里对送来的每首直接查最早版本，不再重复关键词过滤，避免漏掉专辑名不带关键词的精选集
-          if (s.year) {
-            const earliest = await findOriginalYear(s.name, s.artist);
-            if (earliest && earliest <= s.year - 3) originalYear = earliest;
-          }
-          results[i] = { originalYear };
-        }
-      };
-      await Promise.all(Array.from({ length: Math.min(5, songs.length) }, worker));
+      // 疑似判定由调用方负责（关键词标记，或同一批歌里已有更早的同名同歌手版本且可内部直判的不送过来）；
+      // 这里对送来的歌批量查最早版本，不再重复关键词过滤，避免漏掉专辑名不带关键词的精选集
+      const items = songs.map((s) => ({ name: s.name, artist: s.artist, year: s.year }));
+      const earliestList = await resolveOriginalYears(items);
+      const results = songs.map((s, i) => {
+        const earliest = earliestList[i];
+        return { originalYear: s.year && earliest && earliest <= s.year - 3 ? earliest : null };
+      });
       sendJson(res, 200, { results });
     } catch (e) {
       const m = mapApiError(e);

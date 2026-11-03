@@ -37,10 +37,15 @@ function isTransient(e) {
   if (e && e.body && (e.body.code === 502 || e.body.code === 503 || e.body.code === -462)) return true;
   return false;
 }
-async function callApi(fn, label, attempts = 4) {
+async function callApi(fn, label, attempts = 4, timeoutMs = 0) {
   let lastErr;
   for (let attempt = 0; attempt < attempts; attempt++) {
-    try { return await fn(); } catch (e) {
+    try {
+      const p = fn();
+      return timeoutMs
+        ? await Promise.race([p, sleep(timeoutMs).then(() => { throw new Error('timeout'); })])
+        : await p;
+    } catch (e) {
       lastErr = e;
       if (!isTransient(e) || attempt === attempts - 1) break;
       await sleep(1000 * Math.pow(2, attempt));
@@ -96,80 +101,125 @@ function cleanTitle(t) {
 }
 const normName = (s) => String(s || '').toLowerCase().replace(/[\s・·.\-_]/g, '');
 
-const originalYearCache = new Map();
-async function findOriginalYear(name, artist) {
+const originalYearCache = new Map(); // 「清洗歌名|歌手」-> 最早版本年份
+const albumYearCache = new Map(); // 专辑 ID -> 发行年份（由计入歌曲顺手填充，校正时命中就不用再查）
+
+async function searchCandidates(name, artist) {
   const base = cleanTitle(name);
-  if (!base || !artist) return null;
-  const key = `${base}|${normName(artist)}`;
-  if (originalYearCache.has(key)) return originalYearCache.get(key);
-  let earliest = null;
-  let failed = false;
-  try {
-    // 校正搜索只重试 3 次：失败只是少校正一首，不值得拖慢整体
-    const r = await callApi(() => api.cloudsearch({ keywords: `${base} ${artist}`, type: 1, limit: 30, ...BASE }), '原版年份搜索', 3);
-    const found = ((r.body.result && r.body.result.songs) || [])
-      .filter((s) => cleanTitle(s.name) === base && (s.ar || []).some((a) => normName(a.name) === normName(artist)));
-    if (found.length) {
-      const sd = await callApi(() => api.song_detail({ ids: found.map((s) => s.id).join(','), ...BASE }), '原版年份详情', 3);
-      for (const s of sd.body.songs || []) {
-        const ts = (s.al && s.al.publishTime) || s.publishTime;
-        if (ts) {
-          const y = new Date(ts).getFullYear();
-          if (y >= 1900 && y <= CURRENT_YEAR && (!earliest || y < earliest)) earliest = y;
-        }
-      }
-    }
-  } catch (e) { earliest = null; failed = true; }
-  if (!failed) originalYearCache.set(key, earliest);
-  return earliest;
+  const r = await callApi(
+    () => api.cloudsearch({ keywords: `${base} ${artist}`, type: 1, limit: 30, ...BASE }),
+    '原版年份搜索', 3, 20000,
+  );
+  return ((r.body.result && r.body.result.songs) || [])
+    .filter((s) => cleanTitle(s.name) === base && (s.ar || []).some((a) => normName(a.name) === normName(artist)))
+    .map((s) => ({ id: s.id, albumId: s.al ? s.al.id : 0 }));
 }
 
 // 只校正「最早版本比当前计入年份早 3 年以上」的情况，过滤掉一两年的噪声。原地改 year。
-// 先按「清洗后歌名+主歌手」分组去重（同一首歌在多个歌单重复出现只搜一次），再 5 路并发搜索：
-// 逐首串行时几百首疑似歌曲要几十分钟，并发+去重后快数倍。
+// 优化后的三段流水线（旧做法是逐组「搜索+详情」两次往返，600 组要上千次小请求、约 15 分钟）：
+//   0) 内部直判：同一批歌里已有同名同歌手的干净原版（最早版本本身不带重制标记）时，
+//      直接用批内最早年份校正，整组免搜索——凯的歌单实测 600 组里有 123 组可这样跳过；
+//   1) 其余组按「清洗歌名+歌手」分组，8 路并发搜索只拿候选 ID（基准实测并发 8 最快，约是并发 3 的 3 倍）；
+//   2) 候选按专辑去重后合并成 500 一批的大详情请求（80 组实测详情请求从约 90 次降到 1 次），
+//      年份以详情返回的专辑 ID 为准入 albumYearCache，本来就在歌单里的专辑直接命中缓存。
 async function correctSongList(list) {
+  const keyOf = (s) => `${cleanTitle(s.name)}|${normName(s.artist.split(' / ')[0])}`;
+  for (const s of list) if (s.albumId && s.year) albumYearCache.set(s.albumId, s.year);
   // 疑似判定有两种：①歌名/专辑名带重制、再版、精选等关键词；
   // ②同一批歌里已有同名同歌手的更早版本（早 3 年以上）——这首多半来自精选集或再版，
   //   即使专辑名不带任何关键词（如精选集《Warheads On Foreheads》）也能抓到。
+  const byKey = new Map();
   const internalEarliest = new Map();
   for (const s of list) {
     if (!s.year) continue;
-    const key = `${cleanTitle(s.name)}|${normName(s.artist.split(' / ')[0])}`;
+    const key = keyOf(s);
+    if (!byKey.has(key)) byKey.set(key, []);
+    byKey.get(key).push(s);
     if (!internalEarliest.has(key) || s.year < internalEarliest.get(key)) internalEarliest.set(key, s.year);
   }
   const groups = new Map();
   for (const s of list) {
     if (!s.year) continue;
-    const key = `${cleanTitle(s.name)}|${normName(s.artist.split(' / ')[0])}`;
+    const key = keyOf(s);
     const suspect = isFlagged(s.name, s.album) || internalEarliest.get(key) <= s.year - 3;
     if (!suspect) continue;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(s);
   }
-  const entries = [...groups.values()];
+  const flagged = [...groups.values()].reduce((a, g) => a + g.length, 0);
   let corrected = 0;
   const examples = [];
-  const CONCURRENCY = 5;
-  for (let i = 0; i < entries.length; i += CONCURRENCY) {
-    const chunk = entries.slice(i, i + CONCURRENCY);
-    await Promise.all(chunk.map(async (songs) => {
-      const rep = songs[0];
-      const earliest = await findOriginalYear(rep.name, rep.artist.split(' / ')[0]);
-      if (!earliest) return;
-      for (const s of songs) {
-        if (earliest <= s.year - 3) {
-          if (examples.length < 5) examples.push(`${s.name}（${s.year} → ${earliest}）`);
-          s.year = earliest;
-          corrected++;
+  const applyEarliest = (songs, earliest) => {
+    if (!earliest) return;
+    for (const s of songs) {
+      if (earliest <= s.year - 3) {
+        if (examples.length < 5) examples.push(`${s.name}（${s.year} → ${earliest}）`);
+        s.year = earliest;
+        corrected++;
+      }
+    }
+  };
+  // 0) 内部直判
+  const searchGroups = [];
+  for (const [key, songs] of groups) {
+    const e = internalEarliest.get(key);
+    const earliestCopies = (byKey.get(key) || []).filter((x) => x.year === e);
+    const direct = songs.every((s) => e <= s.year - 3) && !earliestCopies.some((x) => isFlagged(x.name, x.album));
+    if (direct) applyEarliest(songs, e);
+    else if (originalYearCache.has(key)) applyEarliest(songs, originalYearCache.get(key));
+    else searchGroups.push([key, songs]);
+  }
+  if (searchGroups.length) {
+    // 1) 8 路并发搜索
+    const candByKey = new Map();
+    const failedKeys = new Set();
+    let nextIdx = 0;
+    let doneCount = 0;
+    const worker = async () => {
+      while (nextIdx < searchGroups.length) {
+        const [key, songs] = searchGroups[nextIdx++];
+        try { candByKey.set(key, await searchCandidates(songs[0].name, songs[0].artist.split(' / ')[0])); }
+        catch (e) { candByKey.set(key, []); failedKeys.add(key); }
+        doneCount++;
+        if (doneCount % 50 === 0 || doneCount === searchGroups.length) {
+          console.log(`  校正进度 搜索 ${doneCount}/${searchGroups.length} 组`);
         }
       }
-    }));
-    const done = Math.min(i + CONCURRENCY, entries.length);
-    if (done % 50 < CONCURRENCY || done === entries.length) {
-      console.log(`  校正进度 ${done}/${entries.length} 组，已校正 ${corrected} 首`);
+    };
+    await Promise.all(Array.from({ length: Math.min(8, searchGroups.length) }, worker));
+    // 2) 专辑去重 + 批量详情
+    const repByAlbum = new Map();
+    for (const cands of candByKey.values()) {
+      for (const c of cands) if (c.albumId && !repByAlbum.has(c.albumId)) repByAlbum.set(c.albumId, c.id);
+    }
+    const needAlbums = [...repByAlbum.entries()].filter(([aid]) => !albumYearCache.has(aid));
+    const songYearById = new Map();
+    for (let i = 0; i < needAlbums.length; i += 500) {
+      const batch = needAlbums.slice(i, i + 500);
+      try {
+        const sd = await callApi(() => api.song_detail({ ids: batch.map(([, id]) => id).join(','), ...BASE }), '原版年份详情', 3, 30000);
+        for (const s of sd.body.songs || []) {
+          const ts = (s.al && s.al.publishTime) || s.publishTime;
+          if (!ts) continue;
+          const y = new Date(ts).getFullYear();
+          if (y < 1900 || y > CURRENT_YEAR) continue;
+          songYearById.set(s.id, y);
+          if (s.al && s.al.id) albumYearCache.set(s.al.id, y);
+        }
+      } catch (e) { /* 这一批失败，对应组按查不到处理 */ }
+    }
+    // 3) 汇总应用
+    for (const [key, songs] of searchGroups) {
+      const cands = candByKey.get(key) || [];
+      let earliest = null;
+      for (const c of cands) {
+        const y = songYearById.get(c.id) ?? (c.albumId ? albumYearCache.get(c.albumId) : null);
+        if (y && (!earliest || y < earliest)) earliest = y;
+      }
+      if (!failedKeys.has(key)) originalYearCache.set(key, earliest);
+      applyEarliest(songs, earliest);
     }
   }
-  const flagged = entries.reduce((a, g) => a + g.length, 0);
   return { corrected, examples, flagged };
 }
 
@@ -258,7 +308,7 @@ async function main() {
       const year = ts ? new Date(ts).getFullYear() : null;
       const artist = (s.ar || []).map((a) => a.name).join(' / ');
       if (year && year >= 1900 && year <= CURRENT_YEAR) {
-        songs.push({ name: s.name, artist, album: s.al ? s.al.name : '', year, age: CURRENT_YEAR - year + 17 });
+        songs.push({ name: s.name, artist, album: s.al ? s.al.name : '', albumId: s.al ? s.al.id : 0, year, age: CURRENT_YEAR - year + 17 });
       } else noYear++;
     }
     process.stdout.write(`  进度 ${Math.min(i + BATCH, trackIds.length)}/${trackIds.length}\n`);
@@ -317,7 +367,7 @@ async function main() {
           const ts = (s.al && s.al.publishTime) || s.publishTime;
           const y = ts ? new Date(ts).getFullYear() : null;
           if (y && y >= 1900 && y <= CURRENT_YEAR) {
-            metaById.set(s.id, { name: s.name, artist: (s.ar || []).map((a) => a.name).join(' / '), album: s.al ? s.al.name : '', year: y });
+            metaById.set(s.id, { name: s.name, artist: (s.ar || []).map((a) => a.name).join(' / '), album: s.al ? s.al.name : '', albumId: s.al ? s.al.id : 0, year: y });
           }
         }
         await sleep(200);

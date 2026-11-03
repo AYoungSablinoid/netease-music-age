@@ -70,35 +70,72 @@ function cleanTitle(t) {
     .toLowerCase();
 }
 const normName = (s) => String(s || '').toLowerCase().replace(/[\s・·.\-_]/g, '');
+// 本次页面会话里已经查过原版年份的歌曲 ID：主结果阶段查过的歌，在听歌排行阶段不再重复发请求
+const oyCheckedIds = new Set();
+
 async function correctSongs(list, onProgress) {
+  const keyOf = (s) => `${cleanTitle(s.name)}|${normName(s.artist.split(' / ')[0])}`;
+  const byKey = new Map();
   const internalEarliest = new Map();
   for (const s of list) {
     if (!s.year) continue;
-    const key = `${cleanTitle(s.name)}|${normName(s.artist.split(' / ')[0])}`;
+    const key = keyOf(s);
+    if (!byKey.has(key)) byKey.set(key, []);
+    byKey.get(key).push(s);
     if (!internalEarliest.has(key) || s.year < internalEarliest.get(key)) internalEarliest.set(key, s.year);
   }
-  const flagged = list.filter((s) => {
-    if (!s.year) return false;
-    if (FLAG_RE.test(`${s.name} ${s.album || ''}`)) return true;
-    const key = `${cleanTitle(s.name)}|${normName(s.artist.split(' / ')[0])}`;
-    return internalEarliest.get(key) <= s.year - 3;
-  });
-  let corrected = 0;
-  for (let k = 0; k < flagged.length; k += 25) {
-    const chunk = flagged.slice(k, k + 25);
-    if (onProgress) onProgress(Math.min(k + 25, flagged.length), flagged.length);
-    try {
-      const { results } = await getJson('/api/original-years', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ songs: chunk.map((s) => ({ name: s.name, artist: s.artist.split(' / ')[0], album: s.album, year: s.year })) }),
-      });
-      chunk.forEach((s, j) => {
-        const oy = results[j] && results[j].originalYear;
-        if (oy) { s.year = oy; corrected++; }
-      });
-    } catch (e) { /* 校正失败不阻断主结果，保留专辑年份 */ }
+  // 按组处理（与 CLI 同一套规则）：整组都能被批内最早版本直判、且最早版本本身不带重制标记的组，
+  // 直接用批内年份校正、不发请求（实测约 1/5 的组可以这样跳过）；其余组才送后端批量查。
+  const groups = new Map();
+  for (const s of list) {
+    if (!s.year) continue;
+    const key = keyOf(s);
+    if (FLAG_RE.test(`${s.name} ${s.album || ''}`) || internalEarliest.get(key) <= s.year - 3) {
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(s);
+    }
   }
+  const flaggedTotal = [...groups.values()].reduce((a, g) => a + g.length, 0);
+  let corrected = 0;
+  let processed = 0;
+  const toSend = [];
+  for (const [key, songs] of groups) {
+    if (songs.every((s) => s.id != null && oyCheckedIds.has(s.id))) { processed += songs.length; continue; }
+    const e = internalEarliest.get(key);
+    const earliestCopies = (byKey.get(key) || []).filter((x) => x.year === e);
+    const direct = songs.every((s) => e <= s.year - 3) && !earliestCopies.some((x) => FLAG_RE.test(`${x.name} ${x.album || ''}`));
+    if (direct) {
+      for (const s of songs) { s.year = e; corrected++; if (s.id != null) oyCheckedIds.add(s.id); }
+      processed += songs.length;
+    } else {
+      toSend.push(...songs);
+    }
+  }
+  if (onProgress && processed) onProgress(processed, flaggedTotal);
+  // 每批 50 首（后端上限），2 批并行流水：后端内部还有全局并发闸和专辑级批量查详情，不会互相打架
+  const chunks = [];
+  for (let k = 0; k < toSend.length; k += 50) chunks.push(toSend.slice(k, k + 50));
+  let ci = 0;
+  const worker = async () => {
+    while (ci < chunks.length) {
+      const chunk = chunks[ci++];
+      try {
+        const { results } = await getJson('/api/original-years', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ songs: chunk.map((s) => ({ name: s.name, artist: s.artist.split(' / ')[0], album: s.album, year: s.year })) }),
+        });
+        chunk.forEach((s, j) => {
+          const oy = results[j] && results[j].originalYear;
+          if (oy) { s.year = oy; corrected++; }
+          if (s.id != null) oyCheckedIds.add(s.id);
+        });
+      } catch (e) { /* 校正失败不阻断主结果，保留专辑年份 */ }
+      processed += chunk.length;
+      if (onProgress) onProgress(processed, flaggedTotal);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(2, chunks.length) }, worker));
   return corrected;
 }
 
@@ -197,6 +234,7 @@ $('selNone').addEventListener('click', () => setChecks(() => false));
 $('calcBtn').addEventListener('click', async () => {
   const sel = selectedPlaylists();
   if (!sel.length || !currentUser) return;
+  oyCheckedIds.clear();
   hideError($('errorBox2'));
   resultCard.classList.add('hidden');
   $('calcBtn').disabled = true;
