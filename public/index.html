@@ -11,19 +11,23 @@
 <main class="wrap">
   <header class="hero">
     <h1>音乐年龄测试</h1>
-    <p class="tagline">输入网易云音乐主页链接，看看你的耳朵多少岁</p>
+    <p class="tagline">输入网易云音乐或 QQ 音乐主页链接，看看你的耳朵多少岁</p>
     <p class="how">算法很简单：假设每首歌都是在发行那年、你 17 岁时听到的，<br>单曲音乐年龄 = 今年 − 发行年份 + 17，全部取平均。</p>
   </header>
 
   <section class="card" id="formCard">
     <form id="ageForm">
-      <label for="linkInput">网易云音乐主页链接</label>
+      <div class="chTabs">
+        <button type="button" class="chTab active" id="platNetease">网易云音乐</button>
+        <button type="button" class="chTab" id="platQQ">QQ 音乐</button>
+      </div>
+      <label for="linkInput" id="inputLabel">网易云音乐主页链接</label>
       <div class="row">
         <input id="linkInput" type="text" inputmode="url" autocomplete="off" spellcheck="false"
                placeholder="粘贴主页链接，如 https://music.163.com/user/home?id=… 或 App 分享的短链接">
         <button id="submitBtn" type="submit">开始测试</button>
       </div>
-      <p class="hint">怎么拿到链接：在网易云 App 里进入任意用户主页 → 分享 → 复制链接；也可以粘贴电脑端主页链接，或直接填用户 ID。<br>下一步可以勾选要计入哪些歌单——歌单需要设为公开。</p>
+      <p class="hint" id="inputHint">怎么拿到链接：在网易云 App 里进入任意用户主页 → 分享 → 复制链接；也可以粘贴电脑端主页链接，或直接填用户 ID。<br>下一步可以勾选要计入哪些歌单——歌单需要设为公开。</p>
     </form>
     <div id="progress" class="progress hidden">
       <div class="stage" id="stageText">正在解析链接…</div>
@@ -189,8 +193,9 @@
   </section>
 
   <footer class="siteFoot">
-    <p>数据来自网易云公开接口，数据层基于开源项目
+    <p>网易云数据来自公开接口，数据层基于开源项目
       <a href="https://github.com/Binaryify/NeteaseCloudMusicApi" target="_blank" rel="noopener">NeteaseCloudMusicApi</a>；
+      QQ 音乐数据来自其网页端公开只读接口（发行年份按专辑补查，「我喜欢」需登录暂不支持）；
       玩法原型为日本站「音楽数珠つなぎ」30 MUSIC CHALLENGE（该站公布的用户平均音乐年龄为 28 岁）。</p>
     <p><a href="https://github.com/AYoungSablinoid/netease-music-age" target="_blank" rel="noopener">GitHub 源码</a> · 本站只读取公开数据，不保存任何用户信息。</p>
   </footer>

@@ -12,6 +12,10 @@
  *   --ids=<id1,id2>   只算指定的歌单（ID 见 --list）
  *   --list            列出该用户的全部公开歌单后退出
  *   例: node music-age.js "https://music.163.com/user/home?id=1" --all
+ *
+ * QQ 音乐: node music-age.js --qq <QQ号|QQ音乐主页链接|歌单链接> [--list]
+ *   数据来自 QQ 音乐网页端公开只读接口（匿名，前提是主页/歌单公开）；
+ *   默认算全部公开自建歌单（QQ 的「我喜欢」需登录才能读，不在此列），年份按专辑补查。
  */
 const fs = require('fs');
 const path = require('path');
@@ -253,10 +257,149 @@ async function getFullTrackIds(playlist) {
   return trackIds;
 }
 
+// ---- QQ 音乐（网页端公开只读接口，匿名；与 server.js 同一套端点）----
+const QQ_HEADERS = { Referer: 'https://y.qq.com/', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
+const QQ_QS = 'g_tk=5381&loginUin=0&hostUin=0&format=json&inCharset=utf8&outCharset=utf-8&notice=0&platform=yqq.json&needNewCode=0';
+const qqYearCache = new Map();
+function decodeEntities(s) {
+  return String(s || '')
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => String.fromCodePoint(parseInt(n, 16)))
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'");
+}
+async function qqCall(url, label) {
+  let lastErr;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const r = await fetch(url, { headers: QQ_HEADERS });
+      const d = JSON.parse(await r.text());
+      if (d.code !== 0) throw new Error(`code=${d.code}`);
+      return d;
+    } catch (e) { lastErr = e; if (attempt < 3) await sleep(attempt * 1000); }
+  }
+  throw new Error(`${label}失败：${lastErr.message}`);
+}
+async function qqAlbumYear(mid) {
+  if (qqYearCache.has(mid)) return qqYearCache.get(mid);
+  let year = null;
+  try {
+    const d = await qqCall(`https://c.y.qq.com/v8/fcg-bin/fcg_v8_album_info_cp.fcg?albummid=${encodeURIComponent(mid)}&${QQ_QS}`, 'QQ专辑查询');
+    const m = /^(\d{4})/.exec((d.data && d.data.aDate) || '');
+    if (m) { const y = Number(m[1]); if (y >= 1900 && y <= CURRENT_YEAR) year = y; }
+  } catch (e) { /* 查不到按无年份 */ }
+  qqYearCache.set(mid, year);
+  return year;
+}
+async function mainQQ(input, optList) {
+  const s = String(input || '').trim();
+  let playlistId = null;
+  let uin = null;
+  let m = s.match(/playlist\/(\d+)/) || s.match(/[?&](?:disstid|id)=(\d+)/);
+  if (m && /qq\.com/.test(s)) playlistId = m[1];
+  else if ((m = s.match(/profile\/([\w*+=-]+)/))) uin = decodeURIComponent(m[1]);
+  else if (/^\d{5,11}$/.test(s) || /^[\w*=-]{8,64}$/.test(s)) uin = s;
+  if (!playlistId && !uin) throw new Error('无法识别输入：请给 QQ 号、QQ 音乐主页链接或歌单链接。');
+
+  let nickname = 'QQ 音乐歌单';
+  let playlists = [];
+  if (playlistId) {
+    const d = await qqCall(`https://c.y.qq.com/qzone/fcg-bin/fcg_ucc_getcdinfo_byids_cp.fcg?type=1&json=1&utf8=1&onlysong=0&disstid=${playlistId}&${QQ_QS}`, 'QQ歌单查询');
+    const cd = (d.cdlist || [])[0];
+    if (!cd) throw new Error('歌单不存在或未公开。');
+    playlists = [{ id: playlistId, name: decodeEntities(cd.dissname), trackCount: (cd.songlist || []).length, _songs: cd.songlist }];
+  } else {
+    const all = [];
+    for (let sin = 0; ; sin += 100) {
+      const d = await qqCall(`https://c.y.qq.com/rsc/fcgi-bin/fcg_user_created_diss?hostuin=${encodeURIComponent(uin)}&sin=${sin}&size=100&${QQ_QS}`, 'QQ歌单列表查询');
+      const data = d.data || {};
+      if (data.hostname) nickname = decodeEntities(data.hostname);
+      const list = data.disslist || [];
+      all.push(...list);
+      if (!list.length || (data.totoal && all.length >= data.totoal)) break;
+    }
+    playlists = all.filter((p) => p.tid && Number(p.tid) > 0)
+      .map((p) => ({ id: String(p.tid), name: decodeEntities(p.diss_name), trackCount: p.song_cnt || 0 }));
+    console.log(`用户：${nickname}（QQ 音乐）`);
+    if (!playlists.length) throw new Error('没有找到公开的自建歌单（主页未公开，或只有「我喜欢」——QQ 的「我喜欢」需登录才能读）。');
+  }
+  if (optList) {
+    console.log(`公开自建歌单（共 ${playlists.length} 个）：`);
+    playlists.forEach((p) => console.log(`  - ${p.name}｜${p.trackCount} 首｜ID ${p.id}`));
+    return;
+  }
+  console.log('计入的歌单：');
+  playlists.forEach((p) => console.log(`  - ${p.name}（${p.trackCount} 首）`));
+  const byId = new Map();
+  let rawTotal = 0;
+  const fetched = await mapPool(playlists, 4, async (p) => {
+    if (p._songs) return p._songs;
+    const d = await qqCall(`https://c.y.qq.com/qzone/fcg-bin/fcg_ucc_getcdinfo_byids_cp.fcg?type=1&json=1&utf8=1&onlysong=0&disstid=${p.id}&${QQ_QS}`, 'QQ歌单查询');
+    return ((d.cdlist || [])[0] || {}).songlist || [];
+  });
+  for (const list of fetched) {
+    rawTotal += list.length;
+    for (const s of list) {
+      const id = s.songmid || String(s.songid || '');
+      if (id && !byId.has(id)) {
+        byId.set(id, {
+          name: decodeEntities(s.songname),
+          artist: (s.singer || []).map((a) => decodeEntities(a.name)).join(' / '),
+          album: decodeEntities(s.albumname),
+          albummid: s.albummid || '',
+        });
+      }
+    }
+  }
+  const merged = [...byId.values()];
+  const mids = [...new Set(merged.map((x) => x.albummid).filter(Boolean))];
+  console.log(`原始合计 ${rawTotal} 首，去重后 ${merged.length} 首，正在按 ${mids.length} 张专辑补发行年份…`);
+  await mapPool(mids, 6, (mid) => qqAlbumYear(mid));
+  const songs = [];
+  let noYear = 0;
+  for (const x of merged) {
+    const year = x.albummid ? qqYearCache.get(x.albummid) : null;
+    if (year) songs.push({ ...x, year, age: CURRENT_YEAR - year + 17 });
+    else noYear++;
+  }
+  if (!songs.length) throw new Error('没有查到任何歌曲的发行年份，无法计算。');
+  const avg = songs.reduce((a, x) => a + x.age, 0) / songs.length;
+  const musicAge = Math.round(avg);
+  const sortedAges = songs.map((x) => x.age).sort((a, b) => a - b);
+  const mid = Math.floor(sortedAges.length / 2);
+  const medianAge = sortedAges.length % 2 ? sortedAges[mid] : Math.round((sortedAges[mid - 1] + sortedAges[mid]) / 2);
+  const byYear = [...songs].sort((a, b) => a.year - b.year);
+  const decades = {};
+  for (const x of songs) { const d = Math.floor(x.year / 10) * 10; decades[d] = (decades[d] || 0) + 1; }
+  const artistCount = {};
+  for (const x of songs) for (const a of x.artist.split(' / ')) if (a) artistCount[a] = (artistCount[a] || 0) + 1;
+  const topArtists = Object.entries(artistCount).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  console.log('\n========== 结果（QQ 音乐）==========');
+  console.log(`${nickname} 的音乐年龄是 ${musicAge} 岁（= ${generationLabel(musicAge)}）`);
+  console.log(`中位数音乐年龄 ${medianAge} 岁`);
+  console.log(`参与计算 ${songs.length} 首（去重后共 ${merged.length} 首，另有 ${noYear} 首缺发行年份未计入）`);
+  console.log(`最老的歌：${byYear[0].name} — ${byYear[0].artist}（${byYear[0].year} 年，单曲音乐年龄 ${byYear[0].age} 岁）`);
+  console.log(`最新的歌：${byYear[byYear.length - 1].name} — ${byYear[byYear.length - 1].artist}（${byYear[byYear.length - 1].year} 年）`);
+  console.log('年代分布：', Object.entries(decades).sort((a, b) => a[0] - b[0]).map(([d, c]) => `${d}年代 ${c} 首`).join('、'));
+  console.log('最爱歌手 Top5：', topArtists.map(([a, c]) => `${a}（${c} 首）`).join('、'));
+  const outDir = path.join(__dirname, 'output');
+  fs.mkdirSync(outDir, { recursive: true });
+  const tag = playlistId ? `pl${playlistId}` : String(uin).replace(/[^\w]/g, '');
+  fs.writeFileSync(path.join(outDir, `music-age-qq-${tag}.json`), JSON.stringify({ platform: 'qq', nickname, playlists: playlists.map((p) => ({ id: p.id, name: p.name, trackCount: p.trackCount })), rawTotal, uniqueTotal: merged.length, counted: songs.length, noYear, musicAge, avgAge: +avg.toFixed(1), medianAge, label: generationLabel(musicAge), generatedAt: new Date().toISOString() }, null, 2));
+  console.log(`\n结果 JSON 已生成：${path.join(outDir, `music-age-qq-${tag}.json`)}`);
+}
+
 async function main() {
+  const argv = process.argv.slice(2);
+  const qqIdx = argv.indexOf('--qq');
+  if (qqIdx >= 0) {
+    const input = argv[qqIdx + 1];
+    if (!input) { console.error('用法: node music-age.js --qq <QQ号|QQ音乐主页链接|歌单链接> [--list]'); process.exit(2); }
+    await mainQQ(input, argv.includes('--list'));
+    return;
+  }
   const input = process.argv[2];
   const flags = process.argv.slice(3);
-  if (!input) { console.error('用法: node music-age.js <网易云主页链接|用户ID> [--all | --ids=<id1,id2> | --list]'); process.exit(2); }
+  if (!input) { console.error('用法: node music-age.js <网易云主页链接|用户ID> [--all | --ids=<id1,id2> | --list]；QQ 音乐用 --qq'); process.exit(2); }
   const optAll = flags.includes('--all');
   const optList = flags.includes('--list');
   const idsFlag = flags.find((f) => f.startsWith('--ids='));

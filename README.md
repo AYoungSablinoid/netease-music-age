@@ -1,8 +1,10 @@
-# 音乐年龄测试（中文版 · 网易云）
+# 音乐年龄测试（中文版 · 网易云 + QQ 音乐）
 
-**在线体验：[netease-music-age.onrender.com](https://netease-music-age.onrender.com/)** — 打开就能测，无需安装，粘贴网易云主页链接即可。
+**在线体验：[netease-music-age.onrender.com](https://netease-music-age.onrender.com/)** — 打开就能测，无需安装，粘贴网易云或 QQ 音乐主页链接即可。
 
 输入一个网易云音乐主页链接，勾选 TA 的任意公开歌单（「我喜欢的音乐」、自建歌单、收藏歌单都可以），根据这些歌单里的全部歌曲，算出 TA 的**音乐年龄**。适合不把歌都放在「喜欢」里、而是分类整理成多个歌单的人。
+
+现已支持 **QQ 音乐**（网站顶部可切换平台）：填 QQ 号、QQ 音乐个人主页链接，或任意公开歌单链接，算法相同。QQ 音乐走其网页端公开只读接口（匿名可读，前提是对方主页/歌单公开）；歌曲本身不带年份，按专辑逐张补查发行日期；「我喜欢」在 QQ 音乐需要登录才能读取，暂不支持——可计算的是公开自建歌单与歌单链接，也没有「听歌排行视角」。其他平台经调研暂无法以同样方式接入：Spotify 自 2026 年 2 月起对新建开发者应用关闭了读取他人资料/歌单的端点（Extended Quota 需企业资质 + 25 万月活）；Apple Music 官方 API 需付费开发者账号签发 token 且没有「他人主页」概念；YouTube Music 的歌曲元数据没有可靠的逐曲发行年份。
 
 玩法来自日本站「音楽数珠つなぎ」的 30 MUSIC CHALLENGE：假设每首歌都是在它发行的那一年、你 17 岁时听到的，那么——
 
@@ -78,6 +80,9 @@ node music-age.js 1
 node music-age.js 1 --list            # 先列出全部公开歌单（含各自的 ID）
 node music-age.js 1 --all             # 「我喜欢的音乐」+ 全部自建歌单
 node music-age.js 1 --ids=123,456     # 只算指定的几个歌单（ID 见 --list）
+node music-age.js --qq 123456789      # QQ 音乐：QQ 号（算全部公开自建歌单）
+node music-age.js --qq "https://y.qq.com/n/ryqq_v2/playlist/9801330057"   # QQ 音乐：直接按一个公开歌单算
+node music-age.js --qq 123456789 --list                                    # QQ 音乐：先列出公开自建歌单
 ```
 
 运行后会输出：

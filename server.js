@@ -11,6 +11,9 @@
  *   GET  /api/record?uid=...    听歌排行：最近一周 + 历史播放最高（对方未公开时 available:false）
  *   POST /api/songs {ids:[..]}  批量取歌曲发行年份（单次 <= 1000 首）
  *   POST /api/original-years    对重制/再版/精选专辑的歌，查同歌手同名歌曲的最早发行年份
+ *   GET  /api/qq/user?uin=...   QQ 音乐用户公开自建歌单（uin 可为 QQ 号或主页加密 uin）
+ *   GET  /api/qq/playlist?id=.. QQ 音乐歌单全部歌曲（含专辑 mid，不含年份）
+ *   POST /api/qq/album-years    按专辑 mid 批量补发行年份 {mids:[..]}（单次 <= 100）
  *
  * 计算（音乐年龄）由前端完成，后端只负责取数，便于部署到任何 Node 托管。
  * 本地运行：node server.js  （端口读 PORT，默认 3000）
@@ -404,6 +407,158 @@ async function handleOriginalYears(req, res) {
   });
 }
 
+// ---- QQ 音乐数据源 ----
+// 与网易云不同，QQ 音乐没有官方匿名 API，走的是网页端只读接口（g_tk=5381 + Referer 即可，
+// 不需要任何人的登录凭证，前提是对方主页/歌单公开）：
+//   用户创建歌单：c.y.qq.com/rsc/fcgi-bin/fcg_user_created_diss（hostuin 可为 QQ 号或主页链接里的加密 uin）
+//   歌单歌曲：    c.y.qq.com/qzone/fcg-bin/fcg_ucc_getcdinfo_byids_cp（返回歌名/歌手/专辑 mid，无年份）
+//   专辑年份：    c.y.qq.com/v8/fcg-bin/fcg_v8_album_info_cp（aDate 为发行日期，按去重专辑补查）
+// 注意：「我喜欢」在 QQ 音乐需要登录态才能读，匿名拿不到，本站 QQ 模式只支持自建歌单 + 公开歌单链接。
+const QQ_HEADERS = {
+  Referer: 'https://y.qq.com/',
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+};
+const qqAlbumYearCache = new Map(); // albummid -> 发行年份（null 表示查过但无日期）
+
+function decodeHtmlEntities(s) {
+  return String(s || '')
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => String.fromCodePoint(parseInt(n, 16)))
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'");
+}
+
+async function qqCall(url, label, timeoutMs = 20000, attempts = 3) {
+  let lastErr;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const r = await withTimeout(fetch(url, { headers: QQ_HEADERS }), timeoutMs, label);
+      const text = await r.text();
+      const data = JSON.parse(text);
+      if (data.code !== 0) throw Object.assign(new Error(`${label}返回 code=${data.code}`), { qqCode: data.code });
+      return data;
+    } catch (e) {
+      lastErr = e;
+      if (attempt < attempts) await sleep(attempt * 1000);
+    }
+  }
+  throw lastErr;
+}
+
+const QQ_BASE_QS = 'g_tk=5381&loginUin=0&hostUin=0&format=json&inCharset=utf8&outCharset=utf-8&notice=0&platform=yqq.json&needNewCode=0';
+
+async function qqUserPlaylists(uin) {
+  const all = [];
+  let nickname = '';
+  for (let sin = 0; ; sin += 100) {
+    const d = await qqCall(
+      `https://c.y.qq.com/rsc/fcgi-bin/fcg_user_created_diss?hostuin=${encodeURIComponent(uin)}&sin=${sin}&size=100&${QQ_BASE_QS}`,
+      'QQ音乐歌单列表查询',
+    );
+    const data = d.data || {};
+    if (data.hostname) nickname = decodeHtmlEntities(data.hostname);
+    const list = data.disslist || [];
+    all.push(...list);
+    const total = data.totoal || 0; // 接口字段就拼作 totoal
+    if (!list.length || (total && all.length >= total)) break;
+  }
+  // tid=0 的是 QZone 背景音乐之类的系统伪歌单，过滤掉
+  const playlists = all
+    .filter((p) => p.tid && Number(p.tid) > 0)
+    .map((p) => ({
+      id: String(p.tid),
+      name: decodeHtmlEntities(p.diss_name),
+      trackCount: p.song_cnt || 0,
+      coverImgUrl: p.diss_cover || '',
+      creatorName: nickname,
+      kind: 'own',
+    }));
+  return { nickname, playlists };
+}
+
+async function qqPlaylistSongs(tid) {
+  const d = await qqCall(
+    `https://c.y.qq.com/qzone/fcg-bin/fcg_ucc_getcdinfo_byids_cp.fcg?type=1&json=1&utf8=1&onlysong=0&disstid=${encodeURIComponent(tid)}&${QQ_BASE_QS}`,
+    'QQ音乐歌单详情查询',
+  );
+  const cd = (d.cdlist || [])[0];
+  if (!cd) throw new Error('歌单不存在或未公开');
+  const songs = (cd.songlist || []).map((s) => ({
+    id: s.songmid || String(s.songid || ''),
+    name: decodeHtmlEntities(s.songname),
+    artist: (s.singer || []).map((a) => decodeHtmlEntities(a.name)).join(' / '),
+    album: decodeHtmlEntities(s.albumname),
+    albummid: s.albummid || '',
+  })).filter((s) => s.id && s.name);
+  return { name: decodeHtmlEntities(cd.dissname), songs };
+}
+
+async function qqAlbumYear(albummid) {
+  if (qqAlbumYearCache.has(albummid)) return qqAlbumYearCache.get(albummid);
+  let year = null;
+  try {
+    const d = await qqCall(
+      `https://c.y.qq.com/v8/fcg-bin/fcg_v8_album_info_cp.fcg?albummid=${encodeURIComponent(albummid)}&${QQ_BASE_QS}`,
+      'QQ音乐专辑查询', 15000, 2,
+    );
+    const m = /^(\d{4})/.exec((d.data && d.data.aDate) || '');
+    if (m) {
+      const y = Number(m[1]);
+      if (y >= 1900 && y <= CURRENT_YEAR) year = y;
+    }
+  } catch (e) { /* 查不到就按无年份处理 */ }
+  if (qqAlbumYearCache.size > 60000) qqAlbumYearCache.clear();
+  qqAlbumYearCache.set(albummid, year);
+  return year;
+}
+
+async function handleQQUser(res, uin) {
+  if (!uin || !/^[\w*=-]{3,64}$/.test(uin)) return sendJson(res, 400, { error: 'QQ 号或主页标识不合法' });
+  try {
+    const { nickname, playlists } = await qqUserPlaylists(uin);
+    if (!playlists.length) {
+      return sendJson(res, 404, { error: '没有找到公开的自建歌单。可能对方主页未公开，或只有「我喜欢」（QQ 音乐的「我喜欢」需要登录才能读取，本站暂不支持）。' });
+    }
+    sendJson(res, 200, { nickname: nickname || 'QQ音乐用户', avatarUrl: '', level: null, playlists });
+  } catch (e) {
+    sendJson(res, 502, { error: `QQ 音乐接口出错：${e.message}` });
+  }
+}
+
+async function handleQQPlaylist(res, id) {
+  if (!/^\d+$/.test(id || '')) return sendJson(res, 400, { error: '歌单 ID 不合法' });
+  try {
+    const data = await qqPlaylistSongs(id);
+    sendJson(res, 200, data);
+  } catch (e) {
+    sendJson(res, 502, { error: `QQ 音乐接口出错：${e.message}` });
+  }
+}
+
+async function handleQQAlbumYears(req, res) {
+  let raw = '';
+  req.on('data', (c) => { raw += c; if (raw.length > 1e6) req.destroy(); });
+  req.on('end', async () => {
+    try {
+      const { mids } = JSON.parse(raw || '{}');
+      if (!Array.isArray(mids) || !mids.length || mids.length > 100 || !mids.every((m) => typeof m === 'string')) {
+        return sendJson(res, 400, { error: '参数不合法：mids 应为 1~100 个专辑 mid' });
+      }
+      const years = {};
+      let next = 0;
+      const worker = async () => {
+        while (next < mids.length) {
+          const mid = mids[next++];
+          years[mid] = await qqAlbumYear(mid);
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(6, mids.length) }, worker));
+      sendJson(res, 200, { years });
+    } catch (e) {
+      sendJson(res, 502, { error: `QQ 音乐接口出错：${e.message}` });
+    }
+  });
+}
+
 const MIME = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon' };
 
 const server = http.createServer(async (req, res) => {
@@ -425,6 +580,9 @@ const server = http.createServer(async (req, res) => {
   if (pathname === '/api/record' && req.method === 'GET') return handleRecord(res, url.searchParams.get('uid'));
   if (pathname === '/api/songs' && req.method === 'POST') return handleSongs(req, res);
   if (pathname === '/api/original-years' && req.method === 'POST') return handleOriginalYears(req, res);
+  if (pathname === '/api/qq/user' && req.method === 'GET') return handleQQUser(res, url.searchParams.get('uin'));
+  if (pathname === '/api/qq/playlist' && req.method === 'GET') return handleQQPlaylist(res, url.searchParams.get('id'));
+  if (pathname === '/api/qq/album-years' && req.method === 'POST') return handleQQAlbumYears(req, res);
   if (pathname.startsWith('/api/')) return sendJson(res, 404, { error: '接口不存在' });
 
   // 静态文件

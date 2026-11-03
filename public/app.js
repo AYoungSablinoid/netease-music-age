@@ -28,6 +28,8 @@ const resultCard = $('resultCard');
 
 let currentUser = null; // /api/user 的返回：{nickname, avatarUrl, level, playlists[]}
 let currentUid = null;
+let platform = 'netease'; // 表单上选中的平台（netease / qq）
+let currentPlatform = 'netease'; // 当前结果所属平台（计算、听歌排行等按它分支）
 let lastSongs = []; // 最近一次主计算计入的歌曲（分享图和手选挑战都用它）
 let lastResult = null; // 最近一次主结果的汇总数据
 let lastRecordSongs = []; // 听歌排行里的歌曲（周榜+累计榜并集，带年份），用作手选挑战的候选补充
@@ -157,22 +159,84 @@ async function correctSongs(list, onProgress) {
   return corrected;
 }
 
+// ---------- 平台切换（网易云 / QQ 音乐） ----------
+const PLATFORM_UI = {
+  netease: {
+    label: '网易云音乐主页链接',
+    placeholder: '粘贴主页链接，如 https://music.163.com/user/home?id=… 或 App 分享的短链接',
+    hint: '怎么拿到链接：在网易云 App 里进入任意用户主页 → 分享 → 复制链接；也可以粘贴电脑端主页链接，或直接填用户 ID。<br>下一步可以勾选要计入哪些歌单——歌单需要设为公开。',
+    empty: '请先粘贴网易云音乐主页链接。',
+  },
+  qq: {
+    label: 'QQ 号 / QQ 音乐主页或歌单链接',
+    placeholder: '填 QQ 号，或粘贴 QQ 音乐个人主页链接 / 歌单链接',
+    hint: '可以填 QQ 号、QQ 音乐 App 分享的个人主页链接，或任意公开歌单的链接（直接按这个歌单计算）。<br>注意：QQ 音乐的「我喜欢」需要登录才能读取，暂不支持；可计算的是公开的自建歌单和歌单链接。',
+    empty: '请先填写 QQ 号或粘贴 QQ 音乐链接。',
+  },
+};
+function setPlatform(p) {
+  platform = p;
+  $('platNetease').classList.toggle('active', p === 'netease');
+  $('platQQ').classList.toggle('active', p === 'qq');
+  $('inputLabel').textContent = PLATFORM_UI[p].label;
+  input.placeholder = PLATFORM_UI[p].placeholder;
+  $('inputHint').innerHTML = PLATFORM_UI[p].hint;
+}
+$('platNetease').addEventListener('click', () => setPlatform('netease'));
+$('platQQ').addEventListener('click', () => setPlatform('qq'));
+
+// 从 QQ 音乐输入里解析出目标：歌单链接 -> {playlistId}；主页链接/QQ号/加密uin -> {uin}
+function parseQQInput(raw) {
+  const s = String(raw || '').trim();
+  let m = s.match(/playlist\/(\d+)/) || s.match(/[?&](?:disstid|id)=(\d+)/);
+  if (m && /qq\.com|y\.qq/.test(s)) return { playlistId: m[1] };
+  if (/^\d{10,}$/.test(s) && /playlist/.test(s)) return { playlistId: s };
+  m = s.match(/profile\/([\w*+=-]+)/);
+  if (m) return { uin: decodeURIComponent(m[1]) };
+  if (/^\d{5,11}$/.test(s)) return { uin: s }; // QQ 号
+  if (/^[\w*=-]{8,64}$/.test(s)) return { uin: s }; // 加密 uin 原样粘贴
+  return {};
+}
+
 // ---------- 第一步：解析链接，拉取歌单列表 ----------
 form.addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const link = input.value.trim();
-  if (!link) { showError($('errorBox'), '请先粘贴网易云音乐主页链接。'); return; }
+  if (!link) { showError($('errorBox'), PLATFORM_UI[platform].empty); return; }
   hideError($('errorBox'));
   selectCard.classList.add('hidden');
   resultCard.classList.add('hidden');
   submitBtn.disabled = true;
   input.disabled = true;
   try {
-    progress1.show('正在解析链接…', 15);
-    const { uid } = await getJson('/api/resolve?url=' + encodeURIComponent(link));
-    currentUid = uid;
-    progress1.show('正在读取歌单列表…', 60);
-    currentUser = await getJson('/api/user?uid=' + encodeURIComponent(uid));
+    currentPlatform = platform;
+    if (platform === 'qq') {
+      const target = parseQQInput(link);
+      if (target.playlistId) {
+        // 歌单链接：直接把这个歌单作为唯一可选项进入第二步
+        progress1.show('正在读取歌单…', 40);
+        const data = await getJson('/api/qq/playlist?id=' + encodeURIComponent(target.playlistId));
+        currentUid = 'qq-playlist-' + target.playlistId;
+        currentUser = {
+          nickname: 'QQ 音乐歌单',
+          avatarUrl: '',
+          level: null,
+          playlists: [{ id: target.playlistId, name: data.name, trackCount: data.songs.length, coverImgUrl: '', creatorName: '', kind: 'own' }],
+        };
+      } else if (target.uin) {
+        progress1.show('正在读取歌单列表…', 60);
+        currentUid = target.uin;
+        currentUser = await getJson('/api/qq/user?uin=' + encodeURIComponent(target.uin));
+      } else {
+        throw new Error('无法识别这个输入：请填 QQ 号，或粘贴 QQ 音乐个人主页 / 歌单链接。');
+      }
+    } else {
+      progress1.show('正在解析链接…', 15);
+      const { uid } = await getJson('/api/resolve?url=' + encodeURIComponent(link));
+      currentUid = uid;
+      progress1.show('正在读取歌单列表…', 60);
+      currentUser = await getJson('/api/user?uid=' + encodeURIComponent(uid));
+    }
     progress1.show('读取完成', 100);
     renderSelect(currentUser);
   } catch (e) {
@@ -187,6 +251,7 @@ form.addEventListener('submit', async (ev) => {
 // ---------- 第二步：选择歌单 ----------
 function renderSelect(user) {
   $('selNickname').textContent = user.nickname;
+  $('selDefault').textContent = currentPlatform === 'qq' ? '默认：全部自建' : '默认：喜欢 + 自建';
   const subN = user.playlists.filter((p) => p.kind === 'subscribed').length;
   $('selMeta').textContent = subN
     ? `共 ${user.playlists.length} 个公开歌单，其中 ${subN} 个是收藏的别人歌单`
@@ -223,9 +288,9 @@ function renderSelect(user) {
 function selectedPlaylists() {
   if (!currentUser) return [];
   const ids = new Set(
-    [...document.querySelectorAll('.plCheck:checked')].map((cb) => Number(cb.dataset.id)),
+    [...document.querySelectorAll('.plCheck:checked')].map((cb) => cb.dataset.id),
   );
-  return currentUser.playlists.filter((p) => ids.has(p.id));
+  return currentUser.playlists.filter((p) => ids.has(String(p.id)));
 }
 
 function updateSummary() {
@@ -239,7 +304,7 @@ function updateSummary() {
 
 function setChecks(pred) {
   document.querySelectorAll('.plCheck').forEach((cb) => {
-    const p = currentUser.playlists.find((x) => x.id === Number(cb.dataset.id));
+    const p = currentUser.playlists.find((x) => String(x.id) === cb.dataset.id);
     cb.checked = pred(p);
   });
   updateSummary();
@@ -249,6 +314,60 @@ $('selAll').addEventListener('click', () => setChecks(() => true));
 $('selNone').addEventListener('click', () => setChecks(() => false));
 
 // ---------- 第三步：聚合所选歌单并计算 ----------
+// QQ 音乐的计算路径：歌单接口直接给全部歌曲（带专辑 mid、无年份），再按去重专辑批量补年份；不走网易云的校正
+async function calcQQPlaylists(sel) {
+  let plDone = 0;
+  progress2.show('正在读取所选歌单…', 0, `共 ${sel.length} 个歌单`);
+  const plResults = await mapPool(sel, 4, async (p) => {
+    try {
+      return { name: p.name, data: await getJson('/api/qq/playlist?id=' + encodeURIComponent(p.id)) };
+    } catch (e) {
+      return { name: p.name, error: e };
+    } finally {
+      plDone++;
+      progress2.show('正在读取所选歌单…', (plDone / sel.length) * 40, `已读取 ${plDone} / ${sel.length} 个歌单`);
+    }
+  });
+  const failedPlaylists = [];
+  const byId = new Map();
+  let rawTotal = 0;
+  for (const r of plResults) {
+    if (r.error) { failedPlaylists.push(r.name); continue; }
+    rawTotal += r.data.songs.length;
+    for (const s of r.data.songs) if (!byId.has(s.id)) byId.set(s.id, s);
+  }
+  const merged = [...byId.values()];
+  if (!merged.length) throw new Error('所选歌单里没有歌曲，无法计算。');
+  // 按专辑补发行年份：去重后的专辑 100 张一批、3 批并发
+  const mids = [...new Set(merged.map((s) => s.albummid).filter(Boolean))];
+  const years = {};
+  const chunks = [];
+  for (let i = 0; i < mids.length; i += 100) chunks.push(mids.slice(i, i + 100));
+  let doneChunks = 0;
+  await mapPool(chunks, 3, async (chunk) => {
+    const { years: part } = await getJson('/api/qq/album-years', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mids: chunk }),
+    });
+    Object.assign(years, part);
+    doneChunks++;
+    progress2.show('正在按专辑查发行年份…', 40 + (doneChunks / Math.max(1, chunks.length)) * 55, `已查 ${Math.min(doneChunks * 100, mids.length)} / ${mids.length} 张专辑`);
+  });
+  const songs = [];
+  let noYear = 0;
+  for (const s of merged) {
+    const year = s.albummid ? years[s.albummid] : null;
+    if (year) songs.push({ ...s, year });
+    else noYear++;
+  }
+  if (!songs.length) throw new Error('没有查到任何歌曲的发行年份，无法计算。');
+  for (const s of songs) s.age = CURRENT_YEAR - s.year + 17;
+  const avg = songs.reduce((a, s) => a + s.age, 0) / songs.length;
+  progress2.show('正在计算…', 100);
+  renderResult(currentUser, sel, songs, noYear, rawTotal, merged.length, { correctedCount: 0, ageBeforeCorrection: Math.round(avg), failedPlaylists });
+}
+
 $('calcBtn').addEventListener('click', async () => {
   const sel = selectedPlaylists();
   if (!sel.length || !currentUser) return;
@@ -257,6 +376,9 @@ $('calcBtn').addEventListener('click', async () => {
   resultCard.classList.add('hidden');
   $('calcBtn').disabled = true;
   try {
+    if (currentPlatform === 'qq') {
+      await calcQQPlaylists(sel);
+    } else {
     // 拉取各歌单 trackIds 并去重：4 个歌单并发拉（歌单多的用户串行要等几分钟）；
     // 单个歌单失败不中断整体（300 个歌单里总有一两个会碰上接口抖动），失败的记下来在结果里注明
     const idSet = new Set();
@@ -315,6 +437,7 @@ $('calcBtn').addEventListener('click', async () => {
     for (const s of songs) s.age = CURRENT_YEAR - s.year + 17;
     progress2.show('正在计算…', 100);
     renderResult(currentUser, sel, songs, noYear, rawTotal, ids.length, { correctedCount, ageBeforeCorrection, failedPlaylists });
+    }
   } catch (e) {
     showError($('errorBox2'), e.message || '出错了，请重试。');
   } finally {
@@ -394,7 +517,13 @@ function renderResult(user, selPlaylists, songs, noYear, rawTotal, uniqueTotal, 
 
   resultCard.classList.remove('hidden');
   resultCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  recordPromise = loadRecordPanels(musicAge);
+  if (currentPlatform === 'qq') {
+    // QQ 音乐没有匿可读的听歌排行，跳过这一视角（挑战候选池只用歌单歌曲）
+    recordPromise = Promise.resolve();
+    $('recordBox').innerHTML = '<p class="recordNote">QQ 音乐的听歌排行需要登录才能读取，这个视角暂时只支持网易云。</p>';
+  } else {
+    recordPromise = loadRecordPanels(musicAge);
+  }
 }
 
 // ---------- 听歌排行视角：历史最爱 Top100 + 最近一周 ----------
@@ -599,7 +728,7 @@ function updateChCount(extraMsg) {
   const n = chSelected.size;
   $('chCount').textContent =
     (extraMsg ? extraMsg + ' ' : '') +
-    `候选 ${chPool.length} 首（来自这次计算的歌单和听歌排行，可手动添加），已选 ${n} / ${chTarget} 首` +
+    `候选 ${chPool.length} 首（来自这次计算的歌单${currentPlatform === 'netease' ? '和听歌排行' : ''}，可手动添加），已选 ${n} / ${chTarget} 首` +
     (n === chTarget ? '，可以计算了' : n > chTarget ? '，多了，请取消几首' : `，还差 ${chTarget - n} 首`);
   $('chCalcBtn').disabled = n !== chTarget;
 }
