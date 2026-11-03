@@ -109,6 +109,35 @@ button.secondary:hover { background: var(--accent); color: #fff; }
 .siteFoot { color: var(--muted); font-size: 12.5px; text-align: center; }
 .siteFoot a { color: var(--accent); text-decoration: none; }
 .siteFoot a:hover { text-decoration: underline; }
+.selHint { font-size: 14px; margin: 16px 0 10px; }
+.selActions { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+button.mini {
+  padding: 6px 12px; font-size: 13px; font-weight: 500;
+  color: var(--text); background: var(--soft);
+  border: 1px solid var(--border);
+}
+button.mini:hover { border-color: var(--accent); color: var(--accent); background: var(--soft); }
+.playlistRow {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 10px; margin: 0;
+  border: 1px solid var(--border); border-radius: 10px;
+  cursor: pointer; font-weight: 400;
+}
+.playlistRow + .playlistRow { margin-top: 8px; }
+.playlistRow input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--accent); flex-shrink: 0; }
+.plCover { width: 42px; height: 42px; border-radius: 6px; object-fit: cover; flex-shrink: 0; }
+.plMain { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.plName { font-size: 14.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.plSub { color: var(--muted); font-size: 12.5px; }
+.tag {
+  flex-shrink: 0; font-size: 11.5px; padding: 2px 8px; border-radius: 999px;
+  background: var(--soft); color: var(--muted); border: 1px solid var(--border);
+}
+.tag-liked { color: var(--accent); border-color: var(--accent); }
+.selSummary { color: var(--muted); font-size: 13px; margin: 12px 0 10px; }
+#calcBtn { width: 100%; }
+.resultBtns { display: flex; gap: 10px; }
+.resultBtns .secondary { flex: 1; width: auto; }
 @media (max-width: 520px) {
   .row { flex-direction: column; }
   button { width: 100%; }

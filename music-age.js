@@ -1,13 +1,17 @@
 #!/usr/bin/env node
 /**
- * 音乐年龄测试（中文版）
- * 输入网易云音乐主页链接 -> 取「喜欢的音乐」歌单全部歌曲
+ * 音乐年龄测试（中文版）· 命令行版
+ * 输入网易云音乐主页链接 -> 取所选歌单的全部歌曲（跨歌单去重）
  * -> 按专辑发行年份换算音乐年龄：假设每首歌都是在发行那年 17 岁时听的，
  *    单曲音乐年龄 = 当前年份 - 发行年份 + 17，取全部平均。
  * 数据层基于开源项目 Binaryify/NeteaseCloudMusicApi（免登录，只读公开数据）。
  *
- * 用法: node music-age.js <主页链接|用户ID>
- *   例: node music-age.js "https://music.163.com/user/home?id=1"
+ * 用法: node music-age.js <主页链接|用户ID> [选项]
+ *   （无选项）        只算「我喜欢的音乐」歌单
+ *   --all             算「我喜欢的音乐」+ 全部自建歌单
+ *   --ids=<id1,id2>   只算指定的歌单（ID 见 --list）
+ *   --list            列出该用户的全部公开歌单后退出
+ *   例: node music-age.js "https://music.163.com/user/home?id=1" --all
  */
 const fs = require('fs');
 const path = require('path');
@@ -19,6 +23,31 @@ const CURRENT_YEAR = new Date().getFullYear();
 const BATCH = 500;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// 网易云偶尔会断连/限流（aborted、socket hang up、502 等），统一退避重试，与网站后端同一策略
+function errText(e) {
+  if (!e) return '未知错误';
+  if (e.body && (e.body.msg || e.body.message)) return e.body.msg || e.body.message;
+  return e.message || JSON.stringify(e);
+}
+function isTransient(e) {
+  const msg = errText(e);
+  if (/aborted|socket hang up|ECONNRESET|ETIMEDOUT|ECONNREFUSED|timeout/i.test(msg)) return true;
+  if (e && (e.status === 502 || e.status === 503 || e.status === 429)) return true;
+  if (e && e.body && (e.body.code === 502 || e.body.code === 503 || e.body.code === -462)) return true;
+  return false;
+}
+async function callApi(fn, label) {
+  let lastErr;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try { return await fn(); } catch (e) {
+      lastErr = e;
+      if (!isTransient(e) || attempt === 3) break;
+      await sleep(1000 * Math.pow(2, attempt));
+    }
+  }
+  throw new Error(`${label}失败：${errText(lastErr)}`);
+}
 
 async function resolveUid(input) {
   const s = String(input).trim();
@@ -43,43 +72,91 @@ function generationLabel(age) {
   return '黄金年代的耳朵';
 }
 
-async function main() {
-  const input = process.argv[2];
-  if (!input) { console.error('用法: node music-age.js <网易云主页链接|用户ID>'); process.exit(2); }
+function kindOf(p) {
+  return p.specialType === 5 ? 'liked' : p.subscribed ? 'subscribed' : 'own';
+}
+const KIND_LABEL = { liked: '我喜欢的音乐', own: '自建', subscribed: '收藏' };
 
-  const uid = await resolveUid(input);
-  const ud = await api.user_detail({ uid, ...BASE });
-  const profile = ud.body.profile;
-  console.log(`用户：${profile.nickname}（ID ${uid}，Lv.${ud.body.level}）`);
-
-  const up = await api.user_playlist({ uid, limit: 30, ...BASE });
-  const playlists = up.body.playlist || [];
-  const liked = playlists.find((p) => p.specialType === 5);
-  if (!liked) {
-    throw new Error('没有找到公开的「喜欢的音乐」歌单。可能该歌单被设为隐私，请在网易云 App 里把「我喜欢的音乐」设为公开后重试。');
-  }
-  console.log(`歌单：${liked.name}，共 ${liked.trackCount} 首`);
-
-  // 全部 trackIds（playlist_detail 的 trackIds 是完整列表；不足时用 track/all 分页补齐）
-  const pd = await api.playlist_detail({ id: liked.id, ...BASE });
+// 取一个歌单的全量 trackIds（不足时用 track/all 分页补齐）
+async function getFullTrackIds(playlist) {
+  const pd = await callApi(() => api.playlist_detail({ id: playlist.id, ...BASE }), '歌单详情查询');
   let trackIds = (pd.body.playlist.trackIds || []).map((t) => t.id);
-  if (trackIds.length < liked.trackCount) {
+  if (trackIds.length < playlist.trackCount) {
     const seen = new Set(trackIds);
-    for (let offset = 0; offset < liked.trackCount; offset += 1000) {
-      const ta = await api.playlist_track_all({ id: liked.id, limit: 1000, offset, ...BASE });
+    for (let offset = 0; offset < playlist.trackCount; offset += 1000) {
+      const ta = await callApi(() => api.playlist_track_all({ id: playlist.id, limit: 1000, offset, ...BASE }), '歌单分页查询');
       for (const s of ta.body.songs || []) if (!seen.has(s.id)) { seen.add(s.id); trackIds.push(s.id); }
       if ((ta.body.songs || []).length === 0) break;
       await sleep(300);
     }
   }
-  console.log(`已取得 ${trackIds.length} 首的 ID，开始批量查询发行年份…`);
+  return trackIds;
+}
+
+async function main() {
+  const input = process.argv[2];
+  const flags = process.argv.slice(3);
+  if (!input) { console.error('用法: node music-age.js <网易云主页链接|用户ID> [--all | --ids=<id1,id2> | --list]'); process.exit(2); }
+  const optAll = flags.includes('--all');
+  const optList = flags.includes('--list');
+  const idsFlag = flags.find((f) => f.startsWith('--ids='));
+  const optIds = idsFlag ? new Set(idsFlag.slice(6).split(',').map((x) => Number(x.trim())).filter(Boolean)) : null;
+
+  const uid = await resolveUid(input);
+  const ud = await callApi(() => api.user_detail({ uid, ...BASE }), '用户信息查询');
+  const profile = ud.body.profile;
+  console.log(`用户：${profile.nickname}（ID ${uid}，Lv.${ud.body.level}）`);
+
+  // 分页取全部公开歌单
+  const playlists = [];
+  for (let offset = 0; ; offset += 100) {
+    const up = await callApi(() => api.user_playlist({ uid, limit: 100, offset, ...BASE }), '歌单列表查询');
+    const list = up.body.playlist || [];
+    playlists.push(...list);
+    if (!up.body.more || !list.length) break;
+    await sleep(200);
+  }
+  if (!playlists.length) throw new Error('没有找到任何公开歌单。可能对方把歌单都设为了隐私，请在网易云 App 里把歌单设为公开后重试。');
+  for (const p of playlists) p.kind = kindOf(p);
+
+  if (optList) {
+    console.log(`\n全部公开歌单（共 ${playlists.length} 个）：`);
+    playlists.forEach((p, i) => console.log(`  [${i}] ${p.name}｜${KIND_LABEL[p.kind]}｜${p.trackCount} 首｜ID ${p.id}`));
+    console.log('\n用 --ids=<歌单ID1,歌单ID2> 选择要计算的歌单，或 --all 计算喜欢+全部自建歌单。');
+    return;
+  }
+
+  // 选择歌单
+  let selected;
+  if (optIds) selected = playlists.filter((p) => optIds.has(p.id));
+  else if (optAll) selected = playlists.filter((p) => p.kind === 'liked' || p.kind === 'own');
+  else selected = playlists.filter((p) => p.kind === 'liked');
+  if (!selected.length) {
+    throw new Error(optIds
+      ? '指定的歌单 ID 没有匹配到任何公开歌单，先用 --list 查看。'
+      : '没有找到符合条件的公开歌单（默认只算「我喜欢的音乐」，可用 --all 或 --ids 选择其他歌单，先用 --list 查看）。');
+  }
+  console.log('计入的歌单：');
+  selected.forEach((p) => console.log(`  - ${p.name}（${KIND_LABEL[p.kind]}，${p.trackCount} 首）`));
+
+  // 聚合 trackIds 并跨歌单去重
+  const idSet = new Set();
+  let rawTotal = 0;
+  for (const p of selected) {
+    const ids = await getFullTrackIds(p);
+    rawTotal += ids.length;
+    for (const id of ids) idSet.add(id);
+    await sleep(200);
+  }
+  const trackIds = [...idSet];
+  console.log(`原始合计 ${rawTotal} 首，去重后 ${trackIds.length} 首，开始批量查询发行年份…`);
 
   // 分批取歌曲详情 -> 专辑发行年份
   const songs = [];
   let noYear = 0;
   for (let i = 0; i < trackIds.length; i += BATCH) {
     const batch = trackIds.slice(i, i + BATCH);
-    const sd = await api.song_detail({ ids: batch.join(','), ...BASE });
+    const sd = await callApi(() => api.song_detail({ ids: batch.join(','), ...BASE }), '歌曲详情查询');
     for (const s of sd.body.songs || []) {
       const ts = (s.al && s.al.publishTime) || s.publishTime;
       const year = ts ? new Date(ts).getFullYear() : null;
@@ -107,10 +184,13 @@ async function main() {
   const artistCount = {};
   for (const s of songs) for (const a of s.artist.split(' / ')) if (a) artistCount[a] = (artistCount[a] || 0) + 1;
   const topArtists = Object.entries(artistCount).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  const playlistLabel = selected.length === 1 ? selected[0].name : `${selected.length} 个歌单`;
 
   const result = {
-    nickname: profile.nickname, uid, playlistName: liked.name,
-    total: liked.trackCount, counted: songs.length, noYear,
+    nickname: profile.nickname, uid,
+    playlists: selected.map((p) => ({ id: p.id, name: p.name, kind: p.kind, trackCount: p.trackCount })),
+    rawTotal, uniqueTotal: trackIds.length,
+    counted: songs.length, noYear,
     musicAge, avgAge: +avg.toFixed(1), label: generationLabel(musicAge),
     oldest, newest, decades, topArtists,
     generatedAt: new Date().toISOString(),
@@ -118,7 +198,7 @@ async function main() {
 
   console.log('\n========== 结果 ==========');
   console.log(`${profile.nickname} 的音乐年龄是 ${musicAge} 岁（= ${result.label}）`);
-  console.log(`参与计算 ${songs.length} 首（另有 ${noYear} 首缺发行年份未计入）`);
+  console.log(`参与计算 ${songs.length} 首（去重后共 ${trackIds.length} 首，另有 ${noYear} 首缺发行年份未计入）`);
   console.log(`最老的歌：${oldest.name} — ${oldest.artist}（${oldest.year} 年，单曲音乐年龄 ${oldest.age} 岁）`);
   console.log(`最新的歌：${newest.name} — ${newest.artist}（${newest.year} 年）`);
   console.log('年代分布：', Object.entries(decades).sort((a, b) => a[0] - b[0]).map(([d, c]) => `${d}年代 ${c} 首`).join('、'));
@@ -138,13 +218,13 @@ h1{font-size:20px;margin:0 0 4px}.sub{color:#888;font-size:13px;margin-bottom:16
 .grid{display:flex;gap:12px;margin:16px 0}.box{flex:1;background:#fafafa;border-radius:10px;padding:10px 12px;font-size:13px}
 .row{display:flex;align-items:center;gap:8px;font-size:13px;margin:4px 0}.row span:first-child{width:52px}.bar{height:10px;background:#d33;border-radius:5px;min-width:2px}
 .foot{color:#999;font-size:12px;margin-top:16px;line-height:1.6}</style></head><body><div class="card">
-<h1>${profile.nickname} 的音乐年龄</h1><div class="sub">来自歌单「${liked.name}」，共 ${songs.length} 首参与计算</div>
+<h1>${profile.nickname} 的音乐年龄</h1><div class="sub">来自${playlistLabel}，去重后 ${trackIds.length} 首，${songs.length} 首参与计算</div>
 <div class="age">${musicAge} 岁</div><div class="label">= ${result.label}</div>
 <div class="grid"><div class="box">最老的歌<br><b>${oldest.name}</b><br>${oldest.artist} · ${oldest.year} 年</div>
 <div class="box">最新的歌<br><b>${newest.name}</b><br>${newest.artist} · ${newest.year} 年</div></div>
 <h3 style="margin:12px 0 6px">年代分布</h3>${decadeRows}
 <h3 style="margin:14px 0 6px">歌单里最多的歌手</h3><div style="font-size:14px">${topArtists.map(([a, c]) => `${a}（${c} 首）`).join('、')}</div>
-<div class="foot">算法：假设每首歌都是在发行那年 17 岁时听的，单曲音乐年龄 = ${CURRENT_YEAR} − 发行年份 + 17，取全部平均（四舍五入）。另有 ${noYear} 首缺发行年份未计入。作为参照，日本原站「音楽数珠つなぎ」公布的用户平均音乐年龄为 28 岁。数据来自网易云公开接口（NeteaseCloudMusicApi）。</div>
+<div class="foot">计入歌单：${selected.map((p) => p.name).join('、')}。算法：假设每首歌都是在发行那年 17 岁时听的，单曲音乐年龄 = ${CURRENT_YEAR} − 发行年份 + 17，取全部平均（四舍五入）；同一首歌在多个歌单出现只算一次。另有 ${noYear} 首缺发行年份未计入。作为参照，日本原站「音楽数珠つなぎ」公布的用户平均音乐年龄为 28 岁。数据来自网易云公开接口（NeteaseCloudMusicApi）。</div>
 </div></body></html>`;
   const file = path.join(outDir, `music-age-${uid}.html`);
   fs.writeFileSync(file, html);
@@ -152,4 +232,4 @@ h1{font-size:20px;margin:0 0 4px}.sub{color:#888;font-size:13px;margin-bottom:16
   console.log(`\n结果卡已生成：${file}`);
 }
 
-main().catch((e) => { console.error('失败：', e.message || e); process.exit(1); });
+main().catch((e) => { console.error('失败：', errText(e)); process.exit(1); });

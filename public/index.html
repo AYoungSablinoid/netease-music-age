@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>音乐年龄测试 · 你的耳朵多少岁？</title>
-<meta name="description" content="输入网易云音乐主页链接，根据「喜欢的音乐」歌单全量歌曲的发行年份，算出你的音乐年龄。">
+<meta name="description" content="输入网易云音乐主页链接，自选要计入的歌单，按歌曲发行年份算出你的音乐年龄。">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -23,7 +23,7 @@
                placeholder="粘贴主页链接，如 https://music.163.com/user/home?id=… 或 App 分享的短链接">
         <button id="submitBtn" type="submit">开始测试</button>
       </div>
-      <p class="hint">怎么拿到链接：在网易云 App 里进入任意用户主页 → 分享 → 复制链接；也可以粘贴电脑端主页链接，或直接填用户 ID。<br>注意：对方的「我喜欢的音乐」歌单需要设为公开。</p>
+      <p class="hint">怎么拿到链接：在网易云 App 里进入任意用户主页 → 分享 → 复制链接；也可以粘贴电脑端主页链接，或直接填用户 ID。<br>下一步可以勾选要计入哪些歌单——歌单需要设为公开。</p>
     </form>
     <div id="progress" class="progress hidden">
       <div class="stage" id="stageText">正在解析链接…</div>
@@ -31,6 +31,31 @@
       <div class="barText" id="barText"></div>
     </div>
     <div id="errorBox" class="error hidden"></div>
+  </section>
+
+  <section class="card hidden" id="selectCard">
+    <div class="userLine">
+      <img id="selAvatar" alt="" class="avatar hidden">
+      <div>
+        <div class="nickname" id="selNickname"></div>
+        <div class="meta" id="selMeta"></div>
+      </div>
+    </div>
+    <p class="selHint">勾选要计入音乐年龄的歌单（同一首歌在多个歌单里出现，只算一次）：</p>
+    <div class="selActions">
+      <button type="button" class="mini" id="selDefault">默认：喜欢 + 自建</button>
+      <button type="button" class="mini" id="selAll">全选</button>
+      <button type="button" class="mini" id="selNone">全不选</button>
+    </div>
+    <div id="playlistList"></div>
+    <div class="selSummary" id="selSummary"></div>
+    <button id="calcBtn" type="button">开始计算音乐年龄</button>
+    <div id="progress2" class="progress hidden">
+      <div class="stage" id="stageText2">正在读取歌单…</div>
+      <div class="barOuter"><div class="barInner" id="barInner2"></div></div>
+      <div class="barText" id="barText2"></div>
+    </div>
+    <div id="errorBox2" class="error hidden"></div>
   </section>
 
   <section class="card result hidden" id="resultCard">
@@ -56,7 +81,10 @@
     <div class="artists" id="rArtists"></div>
 
     <p class="foot" id="rFoot"></p>
-    <button id="againBtn" class="secondary" type="button">再测一个</button>
+    <div class="resultBtns">
+      <button id="adjustBtn" class="secondary" type="button">调整歌单重测</button>
+      <button id="againBtn" class="secondary" type="button">测另一个人</button>
+    </div>
   </section>
 
   <footer class="siteFoot">

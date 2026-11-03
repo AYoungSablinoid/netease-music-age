@@ -6,7 +6,8 @@
  * 接口：
  *   GET  /api/health            健康检查
  *   GET  /api/resolve?url=...   主页链接/短链接 -> 用户 ID
- *   GET  /api/user?uid=...      用户资料 +「喜欢的音乐」歌单全量 trackIds
+ *   GET  /api/user?uid=...      用户资料 + 全部歌单列表（喜欢/自建/收藏分类）
+ *   GET  /api/playlist?id=...   任意歌单的全量 trackIds
  *   POST /api/songs {ids:[..]}  批量取歌曲发行年份（单次 <= 1000 首）
  *
  * 计算（音乐年龄）由前端完成，后端只负责取数，便于部署到任何 Node 托管。
@@ -90,35 +91,63 @@ async function resolveUid(input) {
   throw Object.assign(new Error('无法从链接中解析出用户 ID，请粘贴网易云音乐主页链接（形如 music.163.com/user/home?id=数字，或 App 分享的短链接）'), { httpStatus: 400 });
 }
 
+// 取一个歌单的全量 trackIds：playlist_detail 的 trackIds 通常是完整的，不足时用 track/all 分页补齐
+async function getFullPlaylist(id) {
+  const pd = await callApi(() => api.playlist_detail({ id, ...BASE }), '歌单详情查询');
+  const pl = pd.body.playlist;
+  let trackIds = (pl.trackIds || []).map((t) => t.id);
+  if (trackIds.length < pl.trackCount) {
+    const seen = new Set(trackIds);
+    for (let offset = 0; offset < pl.trackCount && offset < 50000; offset += 1000) {
+      const ta = await callApi(() => api.playlist_track_all({ id, limit: 1000, offset, ...BASE }), '歌单分页查询');
+      const songs = ta.body.songs || [];
+      for (const s of songs) if (!seen.has(s.id)) { seen.add(s.id); trackIds.push(s.id); }
+      if (!songs.length) break;
+    }
+  }
+  return { id: pl.id, name: pl.name, trackCount: pl.trackCount, trackIds };
+}
+
 async function handleUser(res, uid) {
   if (!/^\d+$/.test(uid || '')) return sendJson(res, 400, { error: '用户 ID 不合法' });
   try {
     const ud = await callApi(() => api.user_detail({ uid, ...BASE }), '用户信息查询');
     const profile = ud.body.profile;
-    const up = await callApi(() => api.user_playlist({ uid, limit: 30, ...BASE }), '歌单列表查询');
-    const liked = (up.body.playlist || []).find((p) => p.specialType === 5);
-    if (!liked) {
-      return sendJson(res, 404, { error: '没有找到公开的「我喜欢的音乐」歌单。可能对方把喜欢歌单设为了隐私——在网易云 App 里把「我喜欢的音乐」设为公开后即可测试。' });
+    // 分页取全部歌单（喜欢的 + 自建的 + 收藏的），供前端多选
+    const all = [];
+    for (let offset = 0; ; offset += 100) {
+      const up = await callApi(() => api.user_playlist({ uid, limit: 100, offset, ...BASE }), '歌单列表查询');
+      const list = up.body.playlist || [];
+      all.push(...list);
+      if (!up.body.more || !list.length) break;
     }
-    const pd = await callApi(() => api.playlist_detail({ id: liked.id, ...BASE }), '歌单详情查询');
-    let trackIds = (pd.body.playlist.trackIds || []).map((t) => t.id);
-    if (trackIds.length < liked.trackCount) {
-      const seen = new Set(trackIds);
-      for (let offset = 0; offset < liked.trackCount && offset < 20000; offset += 1000) {
-        const ta = await callApi(() => api.playlist_track_all({ id: liked.id, limit: 1000, offset, ...BASE }), '歌单分页查询');
-        const songs = ta.body.songs || [];
-        for (const s of songs) if (!seen.has(s.id)) { seen.add(s.id); trackIds.push(s.id); }
-        if (!songs.length) break;
-      }
+    if (!all.length) {
+      return sendJson(res, 404, { error: '没有找到任何公开歌单。可能对方把歌单都设为了隐私——在网易云 App 里把歌单设为公开后即可测试。' });
     }
+    const playlists = all.map((p) => ({
+      id: p.id,
+      name: p.name,
+      trackCount: p.trackCount,
+      coverImgUrl: p.coverImgUrl || '',
+      kind: p.specialType === 5 ? 'liked' : p.subscribed ? 'subscribed' : 'own',
+    }));
     sendJson(res, 200, {
       nickname: profile.nickname,
       avatarUrl: profile.avatarUrl || '',
       level: ud.body.level,
-      playlistName: liked.name,
-      trackCount: liked.trackCount,
-      trackIds,
+      playlists,
     });
+  } catch (e) {
+    const m = mapApiError(e);
+    sendJson(res, m.status, { error: m.error });
+  }
+}
+
+async function handlePlaylist(res, id) {
+  if (!/^\d+$/.test(id || '')) return sendJson(res, 400, { error: '歌单 ID 不合法' });
+  try {
+    const data = await getFullPlaylist(Number(id));
+    sendJson(res, 200, data);
   } catch (e) {
     const m = mapApiError(e);
     sendJson(res, m.status, { error: m.error });
@@ -192,6 +221,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
   if (pathname === '/api/user' && req.method === 'GET') return handleUser(res, url.searchParams.get('uid'));
+  if (pathname === '/api/playlist' && req.method === 'GET') return handlePlaylist(res, url.searchParams.get('id'));
   if (pathname === '/api/songs' && req.method === 'POST') return handleSongs(req, res);
   if (pathname.startsWith('/api/')) return sendJson(res, 404, { error: '接口不存在' });
 
