@@ -179,12 +179,19 @@ const PLATFORM_UI = {
     hint: '酷我网页端没有主页链接，可以填用户 ID（在酷我 App 的个人资料里查看），或粘贴任意公开歌单的链接（直接按这个歌单计算）。<br>公开的「我喜欢听」和自建歌单都可以算。',
     empty: '请先填写酷我用户 ID 或粘贴酷我歌单链接。',
   },
+  kugou: {
+    label: '酷狗老式歌单链接（降级支持）',
+    placeholder: '粘贴酷狗老式歌单链接（链接里带 /special/single/数字.html），或填歌单数字 ID',
+    hint: '酷狗没有可匿名读取他人主页歌单的接口，只能按单个歌单计算，且只支持<b>老式歌单</b>（链接形如 kugou.com/yy/special/single/547134.html）。<br>新版 App 分享的歌单链接（collection 开头）暂时读不到全量歌曲，不支持。',
+    empty: '请先粘贴酷狗老式歌单链接。',
+  },
 };
 function setPlatform(p) {
   platform = p;
   $('platNetease').classList.toggle('active', p === 'netease');
   $('platQQ').classList.toggle('active', p === 'qq');
   $('platKuwo').classList.toggle('active', p === 'kuwo');
+  $('platKugou').classList.toggle('active', p === 'kugou');
   $('inputLabel').textContent = PLATFORM_UI[p].label;
   input.placeholder = PLATFORM_UI[p].placeholder;
   $('inputHint').innerHTML = PLATFORM_UI[p].hint;
@@ -192,6 +199,17 @@ function setPlatform(p) {
 $('platNetease').addEventListener('click', () => setPlatform('netease'));
 $('platQQ').addEventListener('click', () => setPlatform('qq'));
 $('platKuwo').addEventListener('click', () => setPlatform('kuwo'));
+$('platKugou').addEventListener('click', () => setPlatform('kugou'));
+
+// 从酷狗输入里解析出目标：老式歌单链接/纯数字 -> {playlistId}；新版歌单 -> {collection:true}（不支持）
+function parseKugouInput(raw) {
+  const s = String(raw || '').trim();
+  if (/collection[_-]/.test(s)) return { collection: true };
+  let m = s.match(/special\/single\/(\d+)\.html/) || s.match(/[?&]specialid=(\d+)/);
+  if (m) return { playlistId: m[1] };
+  if (/^\d{3,12}$/.test(s)) return { playlistId: s };
+  return {};
+}
 
 // 从 QQ 音乐输入里解析出目标：歌单链接 -> {playlistId}；主页链接/QQ号/加密uin -> {uin}
 function parseQQInput(raw) {
@@ -247,6 +265,24 @@ form.addEventListener('submit', async (ev) => {
       } else {
         throw new Error('无法识别这个输入：请填 QQ 号，或粘贴 QQ 音乐个人主页 / 歌单链接。');
       }
+    } else if (platform === 'kugou') {
+      const target = parseKugouInput(link);
+      if (target.collection) {
+        throw new Error('这是酷狗新版歌单链接（collection 开头），暂时读不到它的全量歌曲；请换一个老式歌单链接（链接里带 /special/single/数字.html 的那种）。');
+      }
+      if (target.playlistId) {
+        progress1.show('正在读取歌单…', 40);
+        const data = await getJson('/api/kugou/playlist?id=' + encodeURIComponent(target.playlistId));
+        currentUid = 'kugou-playlist-' + target.playlistId;
+        currentUser = {
+          nickname: '酷狗音乐歌单',
+          avatarUrl: '',
+          level: null,
+          playlists: [{ id: target.playlistId, name: data.name, trackCount: data.songs.length, coverImgUrl: '', creatorName: '', kind: 'own' }],
+        };
+      } else {
+        throw new Error('无法识别这个输入：请粘贴酷狗老式歌单链接（/special/single/数字.html），或直接填歌单数字 ID。酷狗不支持按用户主页计算。');
+      }
     } else if (platform === 'kuwo') {
       const target = parseKuwoInput(link);
       if (target.playlistId) {
@@ -287,7 +323,7 @@ form.addEventListener('submit', async (ev) => {
 // ---------- 第二步：选择歌单 ----------
 function renderSelect(user) {
   $('selNickname').textContent = user.nickname;
-  $('selDefault').textContent = currentPlatform === 'qq' ? '默认：全部自建' : '默认：喜欢 + 自建';
+  $('selDefault').textContent = (currentPlatform === 'qq' || currentPlatform === 'kugou') ? '默认：全部自建' : '默认：喜欢 + 自建';
   const subN = user.playlists.filter((p) => p.kind === 'subscribed').length;
   $('selMeta').textContent = subN
     ? `共 ${user.playlists.length} 个公开歌单，其中 ${subN} 个是收藏的别人歌单`
@@ -350,13 +386,13 @@ $('selAll').addEventListener('click', () => setChecks(() => true));
 $('selNone').addEventListener('click', () => setChecks(() => false));
 
 // ---------- 第三步：聚合所选歌单并计算 ----------
-// QQ 音乐的计算路径：歌单接口直接给全部歌曲（带专辑 mid、无年份），再按去重专辑批量补年份；不走网易云的校正
-async function calcQQPlaylists(sel) {
+// QQ / 酷狗共用的计算路径：歌单接口直接给全部歌曲（带专辑标识、无年份），再按去重专辑批量补年份；不走网易云的校正
+async function calcByAlbumPlaylists(sel, opts) {
   let plDone = 0;
   progress2.show('正在读取所选歌单…', 0, `共 ${sel.length} 个歌单`);
   const plResults = await mapPool(sel, 4, async (p) => {
     try {
-      return { name: p.name, data: await getJson('/api/qq/playlist?id=' + encodeURIComponent(p.id)) };
+      return { name: p.name, data: await getJson(opts.playlistUrl(p.id)) };
     } catch (e) {
       return { name: p.name, error: e };
     } finally {
@@ -375,16 +411,16 @@ async function calcQQPlaylists(sel) {
   const merged = [...byId.values()];
   if (!merged.length) throw new Error('所选歌单里没有歌曲，无法计算。');
   // 按专辑补发行年份：去重后的专辑 100 张一批、3 批并发
-  const mids = [...new Set(merged.map((s) => s.albummid).filter(Boolean))];
+  const mids = [...new Set(merged.map((s) => s[opts.albumField]).filter(Boolean))];
   const years = {};
   const chunks = [];
   for (let i = 0; i < mids.length; i += 100) chunks.push(mids.slice(i, i + 100));
   let doneChunks = 0;
   await mapPool(chunks, 3, async (chunk) => {
-    const { years: part } = await getJson('/api/qq/album-years', {
+    const { years: part } = await getJson(opts.yearsUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mids: chunk }),
+      body: JSON.stringify({ [opts.bodyField]: chunk }),
     });
     Object.assign(years, part);
     doneChunks++;
@@ -393,7 +429,7 @@ async function calcQQPlaylists(sel) {
   const songs = [];
   let noYear = 0;
   for (const s of merged) {
-    const year = s.albummid ? years[s.albummid] : null;
+    const year = s[opts.albumField] ? years[s[opts.albumField]] : null;
     if (year) songs.push({ ...s, year });
     else noYear++;
   }
@@ -450,7 +486,15 @@ $('calcBtn').addEventListener('click', async () => {
   $('calcBtn').disabled = true;
   try {
     if (currentPlatform === 'qq') {
-      await calcQQPlaylists(sel);
+      await calcByAlbumPlaylists(sel, {
+        playlistUrl: (id) => '/api/qq/playlist?id=' + encodeURIComponent(id),
+        albumField: 'albummid', yearsUrl: '/api/qq/album-years', bodyField: 'mids',
+      });
+    } else if (currentPlatform === 'kugou') {
+      await calcByAlbumPlaylists(sel, {
+        playlistUrl: (id) => '/api/kugou/playlist?id=' + encodeURIComponent(id),
+        albumField: 'albumid', yearsUrl: '/api/kugou/album-years', bodyField: 'ids',
+      });
     } else if (currentPlatform === 'kuwo') {
       await calcKuwoPlaylists(sel);
     } else {
@@ -597,7 +641,9 @@ function renderResult(user, selPlaylists, songs, noYear, rawTotal, uniqueTotal, 
     recordPromise = Promise.resolve();
     $('recordBox').innerHTML = currentPlatform === 'qq'
       ? '<p class="recordNote">QQ 音乐的听歌排行需要登录才能读取，这个视角暂时只支持网易云。</p>'
-      : '<p class="recordNote">酷我音乐没有公开可读的听歌排行，这个视角暂时只支持网易云。</p>';
+      : currentPlatform === 'kugou'
+        ? '<p class="recordNote">酷狗音乐没有公开可读的听歌排行，这个视角暂时只支持网易云。</p>'
+        : '<p class="recordNote">酷我音乐没有公开可读的听歌排行，这个视角暂时只支持网易云。</p>';
   } else {
     recordPromise = loadRecordPanels(musicAge);
   }

@@ -16,6 +16,8 @@
  *   POST /api/qq/album-years    按专辑 mid 批量补发行年份 {mids:[..]}（单次 <= 100）
  *   GET  /api/kuwo/user?uid=... 酷我用户公开歌单（老服务按 uid 列单，含「我喜欢听」）
  *   GET  /api/kuwo/playlist?id= 酷我歌单全部歌曲（逐曲自带发行年份）
+ *   GET  /api/kugou/playlist?id= 酷狗老式歌单全部歌曲（带专辑 ID，不含年份）
+ *   POST /api/kugou/album-years  按专辑 ID 批量补发行年份 {ids:[..]}（单次 <= 100）
  *
  * 计算（音乐年龄）由前端完成，后端只负责取数，便于部署到任何 Node 托管。
  * 本地运行：node server.js  （端口读 PORT，默认 3000）
@@ -713,6 +715,115 @@ async function handleKuwoPlaylist(res, id) {
   }
 }
 
+// ---- 酷狗音乐数据源（降级支持：仅老式数字 ID 歌单链接）----
+// 酷狗没有可匿名枚举他人歌单的接口（用户歌单接口要主人本人的登录 token），主页模式做不了；
+// 新版歌单（collection_ 开头）全量读取又需要整套签名 + 设备注册。这里只支持老式歌单：
+//   歌单歌曲：mobilecdn.kugou.com/api/v3/special/song（零签名，filename 为「歌手 - 歌名」，带 album_id）
+//   歌单信息：mobilecdn.kugou.com/api/v3/special/info（歌单名、曲数）
+//   专辑年份：mobilecdn.kugou.com/api/v3/album/info 的 publishtime（模式同 QQ，按专辑补查）
+const kgAlbumYearCache = new Map();
+
+async function kgCall(url, label) {
+  let lastErr;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const r = await withTimeout(fetch(url, { headers: { 'User-Agent': QQ_HEADERS['User-Agent'] } }), 20000, label);
+      const d = JSON.parse(await r.text());
+      if (d.status !== 1 || (d.errcode !== 0 && d.errcode != null)) throw new Error(`酷狗接口返回 status=${d.status} errcode=${d.errcode}`);
+      return d;
+    } catch (e) { lastErr = e; if (attempt < 3) await sleep(attempt * 1000); }
+  }
+  throw lastErr;
+}
+
+async function kugouPlaylistSongs(specialid) {
+  const info = await kgCall(
+    `http://mobilecdn.kugou.com/api/v3/special/info?specialid=${encodeURIComponent(specialid)}&version=9108&area_code=1`,
+    '酷狗歌单信息查询',
+  );
+  const name = decodeHtmlEntities((info.data || {}).specialname || '');
+  const songs = [];
+  let total = Infinity;
+  for (let page = 1; songs.length < total; page++) {
+    const d = await kgCall(
+      `http://mobilecdn.kugou.com/api/v3/special/song?specialid=${encodeURIComponent(specialid)}&page=${page}&pagesize=300&version=9108&area_code=1`,
+      '酷狗歌单歌曲查询',
+    );
+    const data = d.data || {};
+    total = data.total || 0;
+    const list = data.info || [];
+    if (!list.length) break;
+    for (const t of list) {
+      const fn = decodeHtmlEntities(t.filename || '');
+      const sep = fn.indexOf(' - ');
+      songs.push({
+        id: t.hash || '',
+        name: sep >= 0 ? fn.slice(sep + 3) : fn,
+        artist: sep >= 0 ? fn.slice(0, sep) : '',
+        album: '',
+        albumid: t.album_id && String(t.album_id) !== '0' ? String(t.album_id) : '',
+      });
+    }
+    if (list.length < 300) break;
+  }
+  return { name, songs: songs.filter((s) => s.id && s.name) };
+}
+
+async function kugouAlbumYear(albumid) {
+  if (kgAlbumYearCache.has(albumid)) return kgAlbumYearCache.get(albumid);
+  let year = null;
+  try {
+    const d = await kgCall(
+      `http://mobilecdn.kugou.com/api/v3/album/info?albumid=${encodeURIComponent(albumid)}`,
+      '酷狗专辑查询',
+    );
+    const mm = /^(\d{4})/.exec((d.data && d.data.publishtime) || '');
+    if (mm) {
+      const y = Number(mm[1]);
+      if (y >= 1900 && y <= CURRENT_YEAR) year = y;
+    }
+  } catch (e) { /* 查不到就按无年份处理 */ }
+  if (kgAlbumYearCache.size > 60000) kgAlbumYearCache.clear();
+  kgAlbumYearCache.set(albumid, year);
+  return year;
+}
+
+async function handleKugouPlaylist(res, id) {
+  if (!/^\d+$/.test(id || '')) return sendJson(res, 400, { error: '歌单 ID 不合法（酷狗只支持老式数字 ID 歌单）' });
+  try {
+    const data = await kugouPlaylistSongs(id);
+    if (!data.songs.length) throw new Error('歌单不存在或没有歌曲');
+    sendJson(res, 200, data);
+  } catch (e) {
+    sendJson(res, 502, { error: `酷狗接口出错：${e.message}` });
+  }
+}
+
+async function handleKugouAlbumYears(req, res) {
+  let raw = '';
+  req.on('data', (c) => { raw += c; if (raw.length > 1e6) req.destroy(); });
+  req.on('end', async () => {
+    try {
+      const { ids } = JSON.parse(raw || '{}');
+      if (!Array.isArray(ids) || !ids.length || ids.length > 100 || !ids.every((x) => typeof x === 'string')) {
+        return sendJson(res, 400, { error: '参数不合法：ids 应为 1~100 个专辑 ID' });
+      }
+      const years = {};
+      let next = 0;
+      const worker = async () => {
+        while (next < ids.length) {
+          const id = ids[next++];
+          years[id] = await kugouAlbumYear(id);
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(6, ids.length) }, worker));
+      sendJson(res, 200, { years });
+    } catch (e) {
+      sendJson(res, 502, { error: `酷狗接口出错：${e.message}` });
+    }
+  });
+}
+
 const MIME = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon' };
 
 const server = http.createServer(async (req, res) => {
@@ -739,6 +850,8 @@ const server = http.createServer(async (req, res) => {
   if (pathname === '/api/qq/album-years' && req.method === 'POST') return handleQQAlbumYears(req, res);
   if (pathname === '/api/kuwo/user' && req.method === 'GET') return handleKuwoUser(res, url.searchParams.get('uid'));
   if (pathname === '/api/kuwo/playlist' && req.method === 'GET') return handleKuwoPlaylist(res, url.searchParams.get('id'));
+  if (pathname === '/api/kugou/playlist' && req.method === 'GET') return handleKugouPlaylist(res, url.searchParams.get('id'));
+  if (pathname === '/api/kugou/album-years' && req.method === 'POST') return handleKugouAlbumYears(req, res);
   if (pathname.startsWith('/api/')) return sendJson(res, 404, { error: '接口不存在' });
 
   // 静态文件

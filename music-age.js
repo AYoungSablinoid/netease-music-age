@@ -17,6 +17,7 @@
  *   数据来自 QQ 音乐网页端公开只读接口（匿名，前提是主页/歌单公开）；
  *   默认算全部公开自建歌单（QQ 的「我喜欢」需登录才能读，不在此列），年份按专辑补查。
  * 酷我音乐: node music-age.js --kuwo <酷我用户ID|歌单链接> [--list]
+ * 酷狗音乐（降级，仅老式歌单）: node music-age.js --kugou <老式歌单链接|歌单数字ID>
  *   列单走老服务按 uid 取公开歌单（含「我喜欢听」），取歌走 www 接口、逐曲自带发行年份。
  */
 const fs = require('fs');
@@ -520,8 +521,98 @@ async function mainKuwo(input, optList) {
   console.log('最爱歌手 Top5：', topArtists.map(([a, c]) => `${a}（${c} 首）`).join('、'));
 }
 
+// ---- 酷狗音乐（降级：仅老式数字 ID 歌单）----
+const kgYearCache = new Map();
+async function kgCallCli(url, label) {
+  let lastErr;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const r = await fetch(url, { headers: { 'User-Agent': QQ_HEADERS['User-Agent'] } });
+      const d = JSON.parse(await r.text());
+      if (d.status !== 1 || (d.errcode !== 0 && d.errcode != null)) throw new Error(`status=${d.status} errcode=${d.errcode}`);
+      return d;
+    } catch (e) { lastErr = e; if (attempt < 3) await sleep(attempt * 1000); }
+  }
+  throw new Error(`${label}失败：${lastErr.message}`);
+}
+async function kgAlbumYearCli(albumid) {
+  if (kgYearCache.has(albumid)) return kgYearCache.get(albumid);
+  let year = null;
+  try {
+    const d = await kgCallCli(`http://mobilecdn.kugou.com/api/v3/album/info?albumid=${encodeURIComponent(albumid)}`, '酷狗专辑查询');
+    const m = /^(\d{4})/.exec((d.data && d.data.publishtime) || '');
+    if (m) { const y = Number(m[1]); if (y >= 1900 && y <= CURRENT_YEAR) year = y; }
+  } catch (e) { /* 查不到按无年份 */ }
+  kgYearCache.set(albumid, year);
+  return year;
+}
+async function mainKugou(input) {
+  const s = String(input || '').trim();
+  if (/collection[_-]/.test(s)) throw new Error('这是酷狗新版歌单链接（collection 开头），暂时读不到全量歌曲；请换老式歌单链接（/special/single/数字.html）。');
+  const m = s.match(/special\/single\/(\d+)\.html/) || s.match(/[?&]specialid=(\d+)/);
+  const specialid = m ? m[1] : (/^\d{3,12}$/.test(s) ? s : null);
+  if (!specialid) throw new Error('无法识别输入：请给酷狗老式歌单链接或歌单数字 ID（酷狗不支持按用户主页计算）。');
+  const info = await kgCallCli(`http://mobilecdn.kugou.com/api/v3/special/info?specialid=${specialid}&version=9108&area_code=1`, '酷狗歌单信息查询');
+  const plName = decodeEntities((info.data || {}).specialname || '');
+  const byId = new Map();
+  let total = Infinity;
+  for (let page = 1; byId.size < total; page++) {
+    const d = await kgCallCli(`http://mobilecdn.kugou.com/api/v3/special/song?specialid=${specialid}&page=${page}&pagesize=300&version=9108&area_code=1`, '酷狗歌单歌曲查询');
+    const data = d.data || {};
+    total = data.total || 0;
+    const list = data.info || [];
+    if (!list.length) break;
+    for (const t of list) {
+      const fn = decodeEntities(t.filename || '');
+      const sep = fn.indexOf(' - ');
+      const id = t.hash || '';
+      if (id && !byId.has(id)) byId.set(id, { name: sep >= 0 ? fn.slice(sep + 3) : fn, artist: sep >= 0 ? fn.slice(0, sep) : '', album: '', albumid: t.album_id && String(t.album_id) !== '0' ? String(t.album_id) : '' });
+    }
+    if (list.length < 300) break;
+  }
+  const merged = [...byId.values()];
+  if (!merged.length) throw new Error('歌单不存在或没有歌曲。');
+  const albumIds = [...new Set(merged.map((x) => x.albumid).filter(Boolean))];
+  console.log(`歌单：${plName}（酷狗音乐，共 ${merged.length} 首），正在按 ${albumIds.length} 张专辑补发行年份…`);
+  await mapPool(albumIds, 6, (id) => kgAlbumYearCli(id));
+  const songs = [];
+  let noYear = 0;
+  for (const x of merged) {
+    const year = x.albumid ? kgYearCache.get(x.albumid) : null;
+    if (year) songs.push({ ...x, year, age: CURRENT_YEAR - year + 17 });
+    else noYear++;
+  }
+  if (!songs.length) throw new Error('没有查到任何歌曲的发行年份，无法计算。');
+  const avg = songs.reduce((a, x) => a + x.age, 0) / songs.length;
+  const musicAge = Math.round(avg);
+  const sortedAges = songs.map((x) => x.age).sort((a, b) => a - b);
+  const smid = Math.floor(sortedAges.length / 2);
+  const medianAge = sortedAges.length % 2 ? sortedAges[smid] : Math.round((sortedAges[smid - 1] + sortedAges[smid]) / 2);
+  const byYear = [...songs].sort((a, b) => a.year - b.year);
+  const decades = {};
+  for (const x of songs) { const dd = Math.floor(x.year / 10) * 10; decades[dd] = (decades[dd] || 0) + 1; }
+  const artistCount = {};
+  for (const x of songs) if (x.artist) artistCount[x.artist] = (artistCount[x.artist] || 0) + 1;
+  const topArtists = Object.entries(artistCount).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  console.log('\n========== 结果（酷狗音乐）==========');
+  console.log(`歌单「${plName}」的音乐年龄是 ${musicAge} 岁（= ${generationLabel(musicAge)}）`);
+  console.log(`中位数音乐年龄 ${medianAge} 岁`);
+  console.log(`参与计算 ${songs.length} 首（共 ${merged.length} 首，另有 ${noYear} 首缺发行年份未计入）`);
+  console.log(`最老的歌：${byYear[0].name} — ${byYear[0].artist}（${byYear[0].year} 年，单曲音乐年龄 ${byYear[0].age} 岁）`);
+  console.log(`最新的歌：${byYear[byYear.length - 1].name} — ${byYear[byYear.length - 1].artist}（${byYear[byYear.length - 1].year} 年）`);
+  console.log('年代分布：', Object.entries(decades).sort((a, b) => a[0] - b[0]).map(([dd, c]) => `${dd}年代 ${c} 首`).join('、'));
+  console.log('最爱歌手 Top5：', topArtists.map(([a, c]) => `${a}（${c} 首）`).join('、'));
+}
+
 async function main() {
   const argv = process.argv.slice(2);
+  const kgIdx = argv.indexOf('--kugou');
+  if (kgIdx >= 0) {
+    const input = argv[kgIdx + 1];
+    if (!input) { console.error('用法: node music-age.js --kugou <酷狗老式歌单链接|歌单数字ID>'); process.exit(2); }
+    await mainKugou(input);
+    return;
+  }
   const kwIdx = argv.indexOf('--kuwo');
   if (kwIdx >= 0) {
     const input = argv[kwIdx + 1];
