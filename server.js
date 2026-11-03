@@ -14,6 +14,8 @@
  *   GET  /api/qq/user?uin=...   QQ 音乐用户公开自建歌单（uin 可为 QQ 号或主页加密 uin）
  *   GET  /api/qq/playlist?id=.. QQ 音乐歌单全部歌曲（含专辑 mid，不含年份）
  *   POST /api/qq/album-years    按专辑 mid 批量补发行年份 {mids:[..]}（单次 <= 100）
+ *   GET  /api/kuwo/user?uid=... 酷我用户公开歌单（老服务按 uid 列单，含「我喜欢听」）
+ *   GET  /api/kuwo/playlist?id= 酷我歌单全部歌曲（逐曲自带发行年份）
  *
  * 计算（音乐年龄）由前端完成，后端只负责取数，便于部署到任何 Node 托管。
  * 本地运行：node server.js  （端口读 PORT，默认 3000）
@@ -559,6 +561,158 @@ async function handleQQAlbumYears(req, res) {
   });
 }
 
+// ---- 酷我音乐数据源 ----
+// 两段拼起来用（都是匿名、无需任何人的登录凭证，前提是歌单公开）：
+//   列歌单：老服务 nplserver.kuwo.cn/pl.svc?op=getuserlist 按 uid 列出公开歌单（含「我喜欢听」MYFAVORITE、自建 GENERAL）；
+//   取歌曲：www.kuwo.cn/api/www/playlist/playListInfo 分页取全量，逐曲自带 releaseDate（= 所属专辑发行日，
+//           与网易云 album.publishTime 同口径，不用按专辑补查）。
+// www 接口要带一个动态令牌：访问站点时 Set-Cookie 下发 Hm_Iuvt_* 令牌 cookie（名字会被轮换，必须现取），
+// 请求头带 Cookie + csrf=<令牌值> + Secret=h(令牌值, 令牌名)，h() 是酷我前端 JS 的一段变换（下方为等价实现）。
+// 注意：酷我网页端没有「用户主页链接」这种模型，入口只能是 uid 或歌单链接。
+function kuwoH(t, e) {
+  if (e == null || e.length <= 0) return null;
+  let n = '';
+  for (let i = 0; i < e.length; i++) n += e.charCodeAt(i).toString();
+  const r = Math.floor(n.length / 5);
+  const o = parseInt(n.charAt(r) + n.charAt(2 * r) + n.charAt(3 * r) + n.charAt(4 * r) + n.charAt(5 * r));
+  const l = Math.ceil(e.length / 2);
+  const c = Math.pow(2, 31) - 1;
+  if (o < 2) return null;
+  let d = Math.round(1e9 * Math.random()) % 1e8;
+  for (n += d; n.length > 10;) n = (parseInt(n.substring(0, 10)) + parseInt(n.substring(10, n.length))).toString();
+  n = (o * n + l) % c;
+  let f = '';
+  for (let i = 0; i < t.length; i++) {
+    const hv = parseInt(t.charCodeAt(i) ^ Math.floor((n / c) * 255));
+    f += hv < 16 ? '0' + hv.toString(16) : hv.toString(16);
+    n = (o * n + l) % c;
+  }
+  let ds = d.toString(16);
+  for (; ds.length < 8;) ds = '0' + ds;
+  return f + ds;
+}
+
+let kuwoTokenCache = null; // {name, value, cookie, secret, at}
+async function kuwoToken(force) {
+  if (!force && kuwoTokenCache && Date.now() - kuwoTokenCache.at < 10 * 60 * 1000) return kuwoTokenCache;
+  const r = await withTimeout(fetch('https://www.kuwo.cn/', { headers: { 'User-Agent': QQ_HEADERS['User-Agent'] } }), 20000, '酷我令牌获取');
+  const setCookies = typeof r.headers.getSetCookie === 'function' ? r.headers.getSetCookie() : [];
+  const pairs = setCookies.map((sc) => sc.split(';')[0].trim()).filter(Boolean);
+  const tokenPair = pairs.find((p) => /^Hm_Iuvt_[^=]+=/.test(p));
+  if (!tokenPair) throw new Error('没有拿到酷我令牌 cookie');
+  const eq = tokenPair.indexOf('=');
+  const name = tokenPair.slice(0, eq);
+  const value = decodeURIComponent(tokenPair.slice(eq + 1));
+  kuwoTokenCache = { name, value, cookie: pairs.join('; '), secret: kuwoH(value, name), at: Date.now() };
+  return kuwoTokenCache;
+}
+
+async function kuwoWww(pathAndQuery, label) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const tk = await kuwoToken(attempt === 1);
+    const r = await withTimeout(fetch('https://www.kuwo.cn' + pathAndQuery, {
+      headers: {
+        'User-Agent': QQ_HEADERS['User-Agent'],
+        Referer: 'https://www.kuwo.cn/',
+        Cookie: tk.cookie,
+        csrf: tk.value,
+        Secret: tk.secret,
+      },
+    }), 20000, label);
+    const data = JSON.parse(await r.text());
+    if (data && (data.code === 200 || data.success)) return data;
+    if (attempt === 1) throw new Error(`${label}被酷我拒绝（${(data && data.message) || '未知原因'}）`);
+  }
+  throw new Error(`${label}失败`);
+}
+
+async function kuwoPlaylistSongs(pid) {
+  const songs = [];
+  let name = '';
+  let total = Infinity;
+  for (let pn = 1; songs.length < total; pn++) {
+    const d = await kuwoWww(
+      `/api/www/playlist/playListInfo?pid=${encodeURIComponent(pid)}&pn=${pn}&rn=100&httpsStatus=1&reqId=${crypto.randomUUID()}`,
+      '酷我歌单查询',
+    );
+    const data = d.data || {};
+    if (data.name) name = data.name;
+    total = data.total || 0;
+    const list = data.musicList || [];
+    if (!list.length) break;
+    for (const t of list) {
+      const y = t.releaseDate === '1970-01-01' ? null : /^(\d{4})/.exec(t.releaseDate || ''); // 1970-01-01 是酷我的「日期未知」哨兵值
+      songs.push({
+        id: String(t.rid != null ? t.rid : (t.musicrid || '').replace(/^MUSIC_/, '')),
+        name: decodeHtmlEntities(t.name),
+        artist: decodeHtmlEntities(t.artist),
+        album: decodeHtmlEntities(t.album),
+        year: y ? Number(y[1]) : null,
+      });
+    }
+    if (list.length < 100) break;
+  }
+  return { name, songs };
+}
+
+async function handleKuwoUser(res, uid) {
+  if (!/^\d{3,15}$/.test(uid || '')) return sendJson(res, 400, { error: '酷我 uid 不合法（应为纯数字）' });
+  try {
+    const all = [];
+    for (let pn = 0; ; pn++) {
+      const url = `https://nplserver.kuwo.cn/pl.svc?op=getuserlist&uid=${uid}&userid=${uid}&pn=${pn}&rn=200&encode=utf8&keyset=pl2012&identity=kuwo&pcmp4=1&vipver=MUSIC_9.0.5.0_W1&newver=1`;
+      let dd = null;
+      let lastErr;
+      for (let attempt = 1; attempt <= 3 && !dd; attempt++) {
+        try {
+          const r = await withTimeout(fetch(url, { headers: { 'User-Agent': QQ_HEADERS['User-Agent'] } }), 20000, '酷我歌单列表查询');
+          dd = JSON.parse(await r.text());
+        } catch (e) { lastErr = e; if (attempt < 3) await sleep(attempt * 1000); }
+      }
+      if (!dd) throw lastErr || new Error('酷我歌单列表查询失败');
+      const plist = dd.plist || [];
+      all.push(...plist);
+      if (!plist.length || all.length >= (dd.total || 0)) break;
+    }
+    const playlists = all
+      .filter((p) => (p.type === 'MYFAVORITE' || p.type === 'GENERAL') && p.ispub && !p.hidden)
+      .map((p) => ({
+        id: String(p.id),
+        name: decodeHtmlEntities(p.title) || (p.type === 'MYFAVORITE' ? '我喜欢听' : '未命名歌单'),
+        trackCount: p.musicnum || 0,
+        coverImgUrl: '',
+        creatorName: '',
+        kind: p.type === 'MYFAVORITE' ? 'liked' : 'own',
+      }));
+    if (!playlists.length) {
+      return sendJson(res, 404, { error: '没有找到公开的歌单。可能对方没有公开任何自建歌单或「我喜欢听」。' });
+    }
+    // 昵称：借第一个歌单的老接口详情拿 uname
+    let nickname = '酷我用户';
+    try {
+      const r = await withTimeout(fetch(
+        `http://nplserver.kuwo.cn/pl.svc?op=getlistinfo&pid=${playlists[0].id}&pn=0&rn=1&encode=utf8&keyset=pl2012&vipver=MUSIC_9.1.1.2_BCS2&newver=1`,
+        { headers: { 'User-Agent': QQ_HEADERS['User-Agent'] } }), 15000, '酷我用户信息查询');
+      const info = JSON.parse(await r.text());
+      if (info.uname) nickname = info.uname;
+    } catch (e) { /* 拿不到就用默认名 */ }
+    sendJson(res, 200, { nickname, avatarUrl: '', level: null, playlists });
+  } catch (e) {
+    sendJson(res, 502, { error: `酷我接口出错：${e.message}` });
+  }
+}
+
+async function handleKuwoPlaylist(res, id) {
+  if (!/^\d+$/.test(id || '')) return sendJson(res, 400, { error: '歌单 ID 不合法' });
+  try {
+    const data = await kuwoPlaylistSongs(id);
+    if (!data.songs.length) throw new Error('歌单不存在、未公开或没有歌曲');
+    sendJson(res, 200, data);
+  } catch (e) {
+    sendJson(res, 502, { error: `酷我接口出错：${e.message}` });
+  }
+}
+
 const MIME = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon' };
 
 const server = http.createServer(async (req, res) => {
@@ -583,6 +737,8 @@ const server = http.createServer(async (req, res) => {
   if (pathname === '/api/qq/user' && req.method === 'GET') return handleQQUser(res, url.searchParams.get('uin'));
   if (pathname === '/api/qq/playlist' && req.method === 'GET') return handleQQPlaylist(res, url.searchParams.get('id'));
   if (pathname === '/api/qq/album-years' && req.method === 'POST') return handleQQAlbumYears(req, res);
+  if (pathname === '/api/kuwo/user' && req.method === 'GET') return handleKuwoUser(res, url.searchParams.get('uid'));
+  if (pathname === '/api/kuwo/playlist' && req.method === 'GET') return handleKuwoPlaylist(res, url.searchParams.get('id'));
   if (pathname.startsWith('/api/')) return sendJson(res, 404, { error: '接口不存在' });
 
   // 静态文件

@@ -16,6 +16,8 @@
  * QQ 音乐: node music-age.js --qq <QQ号|QQ音乐主页链接|歌单链接> [--list]
  *   数据来自 QQ 音乐网页端公开只读接口（匿名，前提是主页/歌单公开）；
  *   默认算全部公开自建歌单（QQ 的「我喜欢」需登录才能读，不在此列），年份按专辑补查。
+ * 酷我音乐: node music-age.js --kuwo <酷我用户ID|歌单链接> [--list]
+ *   列单走老服务按 uid 取公开歌单（含「我喜欢听」），取歌走 www 接口、逐曲自带发行年份。
  */
 const fs = require('fs');
 const path = require('path');
@@ -388,8 +390,145 @@ async function mainQQ(input, optList) {
   console.log(`\n结果 JSON 已生成：${path.join(outDir, `music-age-qq-${tag}.json`)}`);
 }
 
+// ---- 酷我音乐（列单走老服务 getuserlist，取歌走 www playListInfo，逐曲自带 releaseDate）----
+function kuwoH(t, e) {
+  if (e == null || e.length <= 0) return null;
+  let n = '';
+  for (let i = 0; i < e.length; i++) n += e.charCodeAt(i).toString();
+  const r = Math.floor(n.length / 5);
+  const o = parseInt(n.charAt(r) + n.charAt(2 * r) + n.charAt(3 * r) + n.charAt(4 * r) + n.charAt(5 * r));
+  const l = Math.ceil(e.length / 2);
+  const c = Math.pow(2, 31) - 1;
+  if (o < 2) return null;
+  let d = Math.round(1e9 * Math.random()) % 1e8;
+  for (n += d; n.length > 10;) n = (parseInt(n.substring(0, 10)) + parseInt(n.substring(10, n.length))).toString();
+  n = (o * n + l) % c;
+  let f = '';
+  for (let i = 0; i < t.length; i++) {
+    const hv = parseInt(t.charCodeAt(i) ^ Math.floor((n / c) * 255));
+    f += hv < 16 ? '0' + hv.toString(16) : hv.toString(16);
+    n = (o * n + l) % c;
+  }
+  let ds = d.toString(16);
+  for (; ds.length < 8;) ds = '0' + ds;
+  return f + ds;
+}
+let kuwoTk = null;
+async function kuwoToken(force) {
+  if (!force && kuwoTk) return kuwoTk;
+  const r = await fetch('https://www.kuwo.cn/', { headers: { 'User-Agent': QQ_HEADERS['User-Agent'] } });
+  const pairs = (typeof r.headers.getSetCookie === 'function' ? r.headers.getSetCookie() : []).map((sc) => sc.split(';')[0].trim()).filter(Boolean);
+  const tp = pairs.find((p) => /^Hm_Iuvt_[^=]+=/.test(p));
+  if (!tp) throw new Error('没有拿到酷我令牌 cookie');
+  const eq = tp.indexOf('=');
+  const name = tp.slice(0, eq);
+  const value = decodeURIComponent(tp.slice(eq + 1));
+  kuwoTk = { cookie: pairs.join('; '), csrf: value, secret: kuwoH(value, name) };
+  return kuwoTk;
+}
+async function kuwoWww(pathQ) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const tk = await kuwoToken(attempt === 1);
+    const r = await fetch('https://www.kuwo.cn' + pathQ, { headers: { 'User-Agent': QQ_HEADERS['User-Agent'], Referer: 'https://www.kuwo.cn/', Cookie: tk.cookie, csrf: tk.csrf, Secret: tk.secret } });
+    const d = JSON.parse(await r.text());
+    if (d && (d.code === 200 || d.success)) return d;
+    if (attempt === 1) throw new Error(`酷我接口被拒绝（${(d && d.message) || '未知原因'}）`);
+  }
+  throw new Error('酷我接口失败');
+}
+async function kuwoPlaylistSongs(pid) {
+  const songs = [];
+  let name = '';
+  let total = Infinity;
+  for (let pn = 1; songs.length < total; pn++) {
+    const d = await kuwoWww(`/api/www/playlist/playListInfo?pid=${pid}&pn=${pn}&rn=100&httpsStatus=1&reqId=${require('crypto').randomUUID()}`);
+    const data = d.data || {};
+    if (data.name) name = data.name;
+    total = data.total || 0;
+    const list = data.musicList || [];
+    if (!list.length) break;
+    for (const t of list) {
+      const y = t.releaseDate === '1970-01-01' ? null : /^(\d{4})/.exec(t.releaseDate || ''); // 1970-01-01 是酷我的「日期未知」哨兵值
+      songs.push({ id: String(t.rid != null ? t.rid : ''), name: t.name || '', artist: t.artist || '', album: t.album || '', year: y ? Number(y[1]) : null });
+    }
+    if (list.length < 100) break;
+  }
+  return { name, songs };
+}
+async function mainKuwo(input, optList) {
+  const s = String(input || '').trim();
+  let m = s.match(/playlist_detail\/(\d+)/) || s.match(/[?&]pid=(\d+)/);
+  let nickname = '酷我音乐歌单';
+  let playlists = [];
+  if (m) {
+    playlists = [{ id: m[1], name: '', trackCount: 0, kind: 'own', _pid: m[1] }];
+  } else if (/^\d{3,15}$/.test(s)) {
+    const all = [];
+    for (let pn = 0; ; pn++) {
+      const r = await fetch(`https://nplserver.kuwo.cn/pl.svc?op=getuserlist&uid=${s}&userid=${s}&pn=${pn}&rn=200&encode=utf8&keyset=pl2012&identity=kuwo&pcmp4=1&vipver=MUSIC_9.0.5.0_W1&newver=1`, { headers: { 'User-Agent': QQ_HEADERS['User-Agent'] } });
+      const dd = JSON.parse(await r.text());
+      const plist = dd.plist || [];
+      all.push(...plist);
+      if (!plist.length || all.length >= (dd.total || 0)) break;
+    }
+    playlists = all.filter((p) => (p.type === 'MYFAVORITE' || p.type === 'GENERAL') && p.ispub && !p.hidden)
+      .map((p) => ({ id: String(p.id), name: p.title || (p.type === 'MYFAVORITE' ? '我喜欢听' : '未命名歌单'), trackCount: p.musicnum || 0, kind: p.type === 'MYFAVORITE' ? 'liked' : 'own', _pid: String(p.id) }));
+    nickname = '酷我用户 ' + s;
+    if (!playlists.length) throw new Error('没有找到公开的歌单（对方未公开自建歌单或「我喜欢听」）。');
+    console.log(`用户：${nickname}（酷我音乐）`);
+  } else {
+    throw new Error('无法识别输入：请给酷我用户 ID（纯数字）或酷我歌单链接。');
+  }
+  if (optList) {
+    console.log(`公开歌单（共 ${playlists.length} 个）：`);
+    playlists.forEach((p) => console.log(`  - ${p.name}｜${p.kind === 'liked' ? '我喜欢听' : '自建'}｜${p.trackCount} 首｜ID ${p.id}`));
+    return;
+  }
+  const byId = new Map();
+  let rawTotal = 0;
+  const fetched = await mapPool(playlists, 4, async (p) => kuwoPlaylistSongs(p._pid));
+  for (const d of fetched) {
+    rawTotal += d.songs.length;
+    for (const x of d.songs) if (x.id && !byId.has(x.id)) byId.set(x.id, x);
+  }
+  const merged = [...byId.values()];
+  const songs = [];
+  let noYear = 0;
+  for (const x of merged) {
+    if (x.year) songs.push({ ...x, age: CURRENT_YEAR - x.year + 17 });
+    else noYear++;
+  }
+  if (!songs.length) throw new Error('没有取到任何带发行年份的歌曲，无法计算。');
+  const avg = songs.reduce((a, x) => a + x.age, 0) / songs.length;
+  const musicAge = Math.round(avg);
+  const sortedAges = songs.map((x) => x.age).sort((a, b) => a - b);
+  const mid = Math.floor(sortedAges.length / 2);
+  const medianAge = sortedAges.length % 2 ? sortedAges[mid] : Math.round((sortedAges[mid - 1] + sortedAges[mid]) / 2);
+  const byYear = [...songs].sort((a, b) => a.year - b.year);
+  const decades = {};
+  for (const x of songs) { const d = Math.floor(x.year / 10) * 10; decades[d] = (decades[d] || 0) + 1; }
+  const artistCount = {};
+  for (const x of songs) for (const a of x.artist.split(' / ')) if (a) artistCount[a] = (artistCount[a] || 0) + 1;
+  const topArtists = Object.entries(artistCount).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  console.log('\n========== 结果（酷我音乐）==========');
+  console.log(`${nickname} 的音乐年龄是 ${musicAge} 岁（= ${generationLabel(musicAge)}）`);
+  console.log(`中位数音乐年龄 ${medianAge} 岁`);
+  console.log(`参与计算 ${songs.length} 首（去重后共 ${merged.length} 首，原始合计 ${rawTotal} 首，另有 ${noYear} 首缺发行年份未计入）`);
+  console.log(`最老的歌：${byYear[0].name} — ${byYear[0].artist}（${byYear[0].year} 年，单曲音乐年龄 ${byYear[0].age} 岁）`);
+  console.log(`最新的歌：${byYear[byYear.length - 1].name} — ${byYear[byYear.length - 1].artist}（${byYear[byYear.length - 1].year} 年）`);
+  console.log('年代分布：', Object.entries(decades).sort((a, b) => a[0] - b[0]).map(([d, c]) => `${d}年代 ${c} 首`).join('、'));
+  console.log('最爱歌手 Top5：', topArtists.map(([a, c]) => `${a}（${c} 首）`).join('、'));
+}
+
 async function main() {
   const argv = process.argv.slice(2);
+  const kwIdx = argv.indexOf('--kuwo');
+  if (kwIdx >= 0) {
+    const input = argv[kwIdx + 1];
+    if (!input) { console.error('用法: node music-age.js --kuwo <酷我用户ID|歌单链接> [--list]'); process.exit(2); }
+    await mainKuwo(input, argv.includes('--list'));
+    return;
+  }
   const qqIdx = argv.indexOf('--qq');
   if (qqIdx >= 0) {
     const input = argv[qqIdx + 1];
